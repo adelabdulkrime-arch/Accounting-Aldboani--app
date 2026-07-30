@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import * as XLSX from 'xlsx';
 import {
   LayoutDashboard, BookOpen, Users, Truck, Package, ShoppingCart, FileText,
   ClipboardList, PieChart, Settings as SettingsIcon, Plus, Trash2, Pencil,
   X, Search, AlertTriangle, TrendingUp, TrendingDown, Wallet, Landmark,
   ChevronDown, ChevronRight, Check, Printer, ArrowUpRight, ArrowDownRight,
-  Loader2, Banknote, Menu, CheckCircle2, XCircle
+  Loader2, Banknote, Menu, CheckCircle2, XCircle, Bell, Repeat, Sparkles, Award, Receipt,
+  UserCog, Download
 } from 'lucide-react';
 
 /* ============================== CONSTANTS ============================== */
@@ -19,17 +21,36 @@ const STORAGE_KEYS = {
   purchases: 'purchase-invoices',
   expenses: 'expenses',
   journal: 'journal-entries',
+  reps: 'reps',
+  recurring: 'recurring-templates',
+  payments: 'payments',
+  workers: 'workers',
 };
 
 const DEFAULT_SETTINGS = {
   companyName: 'منشأتي التجارية',
   currency: 'ر.س',
+  taxType: 'percent', // 'percent' | 'fixed'
   taxRate: 15,
+  taxFixedAmount: 0,
   nextSalesNo: 1,
   nextPurchaseNo: 1,
   nextJournalNo: 1,
   nextExpenseNo: 1,
+  nextRepNo: 1,
+  // VIP program
+  vipEnabled: true,
+  vipMonthlyThreshold: 1000000,
+  vipDiscountPercent: 0.5,
+  // credit terms / collections
+  defaultPaymentTermsDays: 30,
+  reminderBeforeDays: 7,
+  overdueBlockThresholdDays: 15, // an invoice overdue by more than this counts against the customer's credit score
+  overdueBlockCount: 2, // this many currently-overdue invoices => credit blocked
+  // distributor commission
+  defaultCommissionPercent: 2,
 };
+
 
 // kind identifies the accounting role an account plays in automatic postings
 const DEFAULT_ACCOUNTS = [
@@ -63,6 +84,23 @@ const ACCOUNT_TYPE_ORDER = ['asset', 'liability', 'equity', 'revenue', 'expense'
 const PAYMENT_METHOD_LABELS = { cash: 'نقدي', bank: 'بنك', credit: 'آجل' };
 
 const UNITS = ['قطعة', 'كرتون', 'كيلوجرام', 'لتر', 'متر', 'علبة', 'صندوق'];
+
+const CURRENCIES = [
+  { label: 'ريال سعودي', symbol: 'ر.س' },
+  { label: 'ريال يمني', symbol: 'ر.ي' },
+  { label: 'درهم إماراتي', symbol: 'د.إ' },
+  { label: 'دينار كويتي', symbol: 'د.ك' },
+  { label: 'ريال قطري', symbol: 'ر.ق' },
+  { label: 'دينار بحريني', symbol: 'د.ب' },
+  { label: 'ريال عماني', symbol: 'ر.ع' },
+  { label: 'جنيه مصري', symbol: 'ج.م' },
+  { label: 'دينار أردني', symbol: 'د.أ' },
+  { label: 'دينار عراقي', symbol: 'د.ع' },
+  { label: 'ليرة لبنانية', symbol: 'ل.ل' },
+  { label: 'ليرة سورية', symbol: 'ل.س' },
+  { label: 'دولار أمريكي', symbol: '$' },
+  { label: 'يورو', symbol: '€' },
+];
 
 /* ================================ HELPERS ================================ */
 
@@ -110,12 +148,338 @@ function accountBalance(account, journalEntries) {
   return { debit, credit, balance: natural };
 }
 
+// Chronological running-balance ledger for a single internal account (cash, bank,
+// AR, AP, inventory...), used for the dashboard/treasury drill-down view.
+function computeAccountLedger(account, journalEntries, from, to) {
+  const isDebitNatural = account.type === 'asset' || account.type === 'expense';
+  const entries = [];
+  journalEntries.forEach(je => {
+    je.lines.forEach(l => {
+      if (l.accountId === account.id) {
+        entries.push({ date: je.date, no: je.no, description: je.description, debit: l.debit, credit: l.credit, sourceType: je.sourceType });
+      }
+    });
+  });
+  entries.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.no - b.no));
+
+  const before = entries.filter(e => from && e.date < from);
+  const opening = before.reduce((s, e) => s + (isDebitNatural ? e.debit - e.credit : e.credit - e.debit), 0);
+
+  const inRange = entries.filter(e => (!from || e.date >= from) && (!to || e.date <= to));
+  let running = opening;
+  const rows = inRange.map(e => {
+    running += isDebitNatural ? e.debit - e.credit : e.credit - e.debit;
+    return { ...e, balance: running };
+  });
+
+  return { opening, rows, closing: running };
+}
+
+// Best-effort amount guess from a pasted wallet/bank SMS - picks the largest
+// plausible number found in the text; the user always reviews/edits it before saving.
+function extractAmountFromText(text) {
+  if (!text) return '';
+  const matches = text.match(/\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?/g);
+  if (!matches) return '';
+  const nums = matches.map(m => Number(m.replace(/,/g, ''))).filter(n => !isNaN(n) && n > 0);
+  if (nums.length === 0) return '';
+  return Math.max(...nums);
+}
+
+/* ============================ EXCEL EXPORT ============================ */
+
+// rows: array of plain objects; keys become column headers in the exported sheet.
+function exportRowsToExcel(filename, sheetName, rows) {
+  try {
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName.slice(0, 31));
+    XLSX.writeFile(wb, `${filename}.xlsx`);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ============================ ITEM CARD (بطاقة صنف) ============================ */
+
+// Chronological quantity + value movement for a single product: purchases in,
+// sales out, running stock balance - the standard "item card" inventory report.
+function computeItemCard(product, salesInvoices, purchaseInvoices, from, to) {
+  let moves = [];
+  purchaseInvoices.forEach(inv => {
+    inv.items.forEach(it => {
+      if (it.productId === product.id) {
+        moves.push({ date: inv.date, order: 1, description: `شراء - فاتورة مشتريات #${inv.no}`, qtyIn: Number(it.qty), qtyOut: 0, unitCost: Number(it.price) });
+      }
+    });
+  });
+  salesInvoices.forEach(inv => {
+    inv.items.forEach(it => {
+      if (it.productId === product.id) {
+        moves.push({ date: inv.date, order: 2, description: `بيع - فاتورة مبيعات #${inv.no}`, qtyIn: 0, qtyOut: Number(it.qty), unitCost: Number(it.cost) || 0 });
+      }
+    });
+  });
+  moves.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.order - b.order));
+
+  const before = moves.filter(m => from && m.date < from);
+  const openingQty = before.reduce((s, m) => s + m.qtyIn - m.qtyOut, 0);
+
+  const inRange = moves.filter(m => (!from || m.date >= from) && (!to || m.date <= to));
+  let running = openingQty;
+  const rows = inRange.map(m => {
+    running += m.qtyIn - m.qtyOut;
+    return { ...m, balance: running };
+  });
+
+  const totalIn = inRange.reduce((s, m) => s + m.qtyIn, 0);
+  const totalOut = inRange.reduce((s, m) => s + m.qtyOut, 0);
+
+  return { openingQty, rows, closingQty: running, totalIn, totalOut };
+}
+
 function filterEntriesByDate(journalEntries, from, to) {
   return journalEntries.filter(je => {
     if (from && je.date < from) return false;
     if (to && je.date > to) return false;
     return true;
   });
+}
+
+/* ============================ DATE MATH ============================ */
+
+function addDays(iso, days) {
+  const d = new Date(iso + 'T00:00:00');
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function addMonths(iso, months) {
+  const d = new Date(iso + 'T00:00:00');
+  d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0, 10);
+}
+
+function daysDiff(fromISO, toISO) {
+  const a = new Date(fromISO + 'T00:00:00');
+  const b = new Date(toISO + 'T00:00:00');
+  return Math.round((b - a) / 86400000);
+}
+
+/* ============================ VIP TIER ============================ */
+
+// Total credit-worthy sales for a customer within the trailing `days` window
+// (used to decide automatic VIP promotion).
+function customerTrailingSales(customerId, salesInvoices, today, days = 30) {
+  const since = addDays(today, -days);
+  return salesInvoices
+    .filter(inv => inv.customerId === customerId && inv.date >= since && inv.date <= today)
+    .reduce((s, inv) => s + inv.total, 0);
+}
+
+function computeCustomerTier(customer, salesInvoices, settings, today) {
+  if (!settings.vipEnabled || !customer) return { tier: 'normal', trailingTotal: 0 };
+  const trailingTotal = customerTrailingSales(customer.id, salesInvoices, today, 30);
+  return { tier: trailingTotal >= settings.vipMonthlyThreshold ? 'vip' : 'normal', trailingTotal };
+}
+
+/* ============================ CREDIT RISK ============================ */
+
+// Looks only at currently-unpaid invoices relative to today vs. their due date.
+function computeCustomerRisk(customer, salesInvoices, settings, today) {
+  if (!customer) return { level: 'excellent', overdueCount: 0, overdueAmount: 0, maxDaysOverdue: 0 };
+  const overdue = salesInvoices.filter(inv => {
+    if (inv.customerId !== customer.id) return false;
+    const remaining = inv.total - inv.paidAmount;
+    if (remaining <= 0.005) return false;
+    if (!inv.dueDate) return false;
+    return inv.dueDate < today;
+  });
+  const overdueAmount = overdue.reduce((s, inv) => s + (inv.total - inv.paidAmount), 0);
+  const maxDaysOverdue = overdue.reduce((m, inv) => Math.max(m, daysDiff(inv.dueDate, today)), 0);
+  let level = 'excellent';
+  if (overdue.length >= settings.overdueBlockCount || maxDaysOverdue > settings.overdueBlockThresholdDays) {
+    level = 'poor';
+  } else if (overdue.length >= 1) {
+    level = 'fair';
+  }
+  return { level, overdueCount: overdue.length, overdueAmount, maxDaysOverdue };
+}
+
+const RISK_LABELS = { excellent: 'ممتاز - يسدد بانتظام', fair: 'متوسط - تأخر بسيط', poor: 'ضعيف - آجل محظور' };
+
+/* ============================ WHATSAPP REMINDERS ============================ */
+
+function cleanPhoneForWhatsApp(phone) {
+  return (phone || '').replace(/[^0-9]/g, '');
+}
+
+function buildWhatsAppLink(phone, message) {
+  const digits = cleanPhoneForWhatsApp(phone);
+  return `https://wa.me/${digits}?text=${encodeURIComponent(message)}`;
+}
+
+// Determine what stage of collections reminder an unpaid invoice is at today.
+function reminderStage(invoice, settings, today) {
+  const remaining = invoice.total - invoice.paidAmount;
+  if (remaining <= 0.005 || !invoice.dueDate) return null;
+  const daysToDue = daysDiff(today, invoice.dueDate); // positive = due in future
+  if (daysToDue < 0) return { stage: 'overdue', daysOverdue: -daysToDue };
+  if (daysToDue === 0) return { stage: 'due_today', daysOverdue: 0 };
+  if (daysToDue <= settings.reminderBeforeDays) return { stage: 'upcoming', daysOverdue: 0, daysToDue };
+  return null;
+}
+
+function composeReminderMessage(stage, invoice, customer, companyName, currency) {
+  const remaining = fmtNum(invoice.total - invoice.paidAmount);
+  const name = customer ? customer.name : 'عميلنا العزيز';
+  if (stage.stage === 'upcoming') {
+    return `مرحبًا ${name}، تذكير لطيف بأن فاتورتكم رقم #${invoice.no} بمبلغ ${remaining} ${currency} لدى ${companyName} يستحق سدادها بتاريخ ${fmtDate(invoice.dueDate)}. نشكر لكم حسن التعامل ونتطلع لتسديدها في موعدها. 🌿`;
+  }
+  if (stage.stage === 'due_today') {
+    return `مرحبًا ${name}، نود تذكيركم بأن فاتورتكم رقم #${invoice.no} بمبلغ ${remaining} ${currency} لدى ${companyName} تستحق السداد اليوم. نرجو التكرم بالسداد في أقرب وقت ممكن لتفادي أي تأخير. شكرًا لتعاونكم.`;
+  }
+  return `السيد/ة ${name}، نحيطكم علمًا بأن فاتورتكم رقم #${invoice.no} بمبلغ ${remaining} ${currency} لدى ${companyName} متأخرة السداد منذ ${stage.daysOverdue} يومًا عن تاريخ الاستحقاق (${fmtDate(invoice.dueDate)}). نأمل تسوية المبلغ خلال 3 أيام عمل تجنبًا لاتخاذ الإجراءات القانونية اللازمة لتحصيل الحقوق.`;
+}
+
+/* ============================ DEMAND FORECAST ============================ */
+
+// Average weekly sales velocity per product over the trailing `days` window,
+// with a simple reorder suggestion for the coming week.
+function computeForecast(products, salesInvoices, today, days = 90) {
+  const since = addDays(today, -days);
+  const weeks = days / 7;
+  const soldQty = {};
+  salesInvoices.forEach(inv => {
+    if (inv.date < since || inv.date > today) return;
+    inv.items.forEach(it => {
+      if (!it.productId) return;
+      soldQty[it.productId] = (soldQty[it.productId] || 0) + Number(it.qty);
+    });
+  });
+  return products.map(p => {
+    const totalSold = soldQty[p.id] || 0;
+    const weeklyAvg = totalSold / weeks;
+    const coverageWeeks = weeklyAvg > 0 ? Number(p.qty) / weeklyAvg : Infinity;
+    const suggestedOrder = weeklyAvg > 0 ? Math.max(0, Math.ceil(weeklyAvg * 2 - Number(p.qty))) : 0;
+    return { product: p, totalSold, weeklyAvg, coverageWeeks, suggestedOrder };
+  }).filter(f => f.totalSold > 0).sort((a, b) => a.coverageWeeks - b.coverageWeeks);
+}
+
+/* ============================ ACCOUNT STATEMENT (كشف حساب) ============================ */
+
+// Builds a chronological running-balance statement for one customer or supplier.
+// debit = increases what they owe us (customer invoice) / what we owe them (supplier invoice)
+// credit = a payment that reduces that balance
+function computeStatement(partyType, partyId, from, to, salesInvoices, purchaseInvoices, payments, accounts) {
+  let allTx = [];
+  if (partyType === 'customer') {
+    allTx = allTx.concat(
+      salesInvoices.filter(inv => inv.customerId === partyId).map(inv => ({
+        date: inv.date, order: 1, description: `فاتورة مبيعات #${inv.no}`, debit: inv.total, credit: 0,
+      })),
+      payments.filter(p => p.type === 'customer' && p.contactId === partyId).map(p => ({
+        date: p.date, order: 2, description: `دفعة مستلمة - ${paymentMethodLabel(p.method, accounts)}`, debit: 0, credit: p.amount,
+      }))
+    );
+  } else {
+    allTx = allTx.concat(
+      purchaseInvoices.filter(inv => inv.supplierId === partyId).map(inv => ({
+        date: inv.date, order: 1, description: `فاتورة مشتريات #${inv.no}`, debit: inv.total, credit: 0,
+      })),
+      payments.filter(p => p.type === 'supplier' && p.contactId === partyId).map(p => ({
+        date: p.date, order: 2, description: `دفعة مسددة - ${paymentMethodLabel(p.method, accounts)}`, debit: 0, credit: p.amount,
+      }))
+    );
+  }
+  allTx.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.order - b.order));
+
+  const before = allTx.filter(t => from && t.date < from);
+  const openingBalance = before.reduce((s, t) => s + t.debit - t.credit, 0);
+
+  const inRange = allTx.filter(t => (!from || t.date >= from) && (!to || t.date <= to));
+  let running = openingBalance;
+  const rows = inRange.map(t => {
+    running += t.debit - t.credit;
+    return { ...t, balance: running };
+  });
+
+  return { openingBalance, rows, closingBalance: running };
+}
+
+/* ============================ RECURRING INVOICES ENGINE ============================
+   Runs once when the app loads: generates any sales invoices that have come due
+   for active recurring templates, advancing each template's next run date.
+   Written as a standalone function (not a hook) so it can run once against the
+   freshly-loaded data before React state settles. */
+
+function runRecurringInvoices({ recurringTemplates, salesInvoices, products, accounts, journalEntries, settings, reps, today }) {
+  let nextSalesNo = settings.nextSalesNo;
+  let nextJournalNo = settings.nextJournalNo;
+  const newSales = [...salesInvoices];
+  const newJournal = [...journalEntries];
+  let workingProducts = products.map(p => ({ ...p }));
+  let generatedCount = 0;
+
+  const nextTemplates = recurringTemplates.map(tpl => {
+    if (!tpl.active) return tpl;
+    let nextRunDate = tpl.nextRunDate;
+    let guard = 0;
+    while (nextRunDate <= today && guard < 24) {
+      guard++;
+      const totals = computeInvoiceTotals(tpl.items, tpl.discount || 0, tpl.applyTax, settings);
+      const no = nextSalesNo;
+      const invId = uid('sinv');
+      const jeNo = nextJournalNo;
+
+      const lines = [];
+      if (tpl.paymentMethod === 'credit') {
+        lines.push({ accountId: getAccountByKind(accounts, 'ar').id, debit: totals.total, credit: 0 });
+      } else {
+        lines.push({ accountId: resolveTreasuryAccountId(tpl.paymentMethod, accounts), debit: totals.total, credit: 0 });
+      }
+      lines.push({ accountId: getAccountByKind(accounts, 'sales_revenue').id, debit: 0, credit: totals.afterDiscount });
+      if (totals.tax > 0) lines.push({ accountId: getAccountByKind(accounts, 'vat_out').id, debit: 0, credit: totals.tax });
+      if (totals.cost > 0) {
+        lines.push({ accountId: getAccountByKind(accounts, 'cogs').id, debit: totals.cost, credit: 0 });
+        lines.push({ accountId: getAccountByKind(accounts, 'inventory').id, debit: 0, credit: totals.cost });
+      }
+      const je = makeEntry(jeNo, nextRunDate, `فاتورة دورية #${no} (${tpl.name || 'اشتراك متكرر'})`, lines, 'sales', invId);
+
+      const rep = tpl.repId ? reps.find(r => r.id === tpl.repId) : null;
+      const commissionAmount = rep ? totals.afterDiscount * (Number(rep.commissionPercent) || 0) / 100 : 0;
+
+      newSales.push({
+        id: invId, no, date: nextRunDate, customerId: tpl.customerId, items: tpl.items,
+        discount: tpl.discount || 0, subtotal: totals.subtotal, tax: totals.tax, total: totals.total,
+        paymentMethod: tpl.paymentMethod, paidAmount: tpl.paymentMethod === 'credit' ? 0 : totals.total,
+        journalId: je.id, dueDate: addDays(nextRunDate, settings.defaultPaymentTermsDays),
+        repId: tpl.repId || null, commissionAmount, isVipSale: false, isRecurring: true,
+      });
+      newJournal.push(je);
+
+      workingProducts = workingProducts.map(p => {
+        const item = tpl.items.find(it => it.productId === p.id);
+        return item ? { ...p, qty: Number(p.qty) - Number(item.qty) } : p;
+      });
+
+      nextSalesNo += 1;
+      nextJournalNo += 1;
+      generatedCount += 1;
+      nextRunDate = tpl.frequency === 'weekly' ? addDays(nextRunDate, 7) : addMonths(nextRunDate, 1);
+    }
+    return { ...tpl, nextRunDate };
+  });
+
+  return {
+    recurringTemplates: nextTemplates,
+    salesInvoices: newSales,
+    products: workingProducts,
+    journalEntries: newJournal,
+    settings: { ...settings, nextSalesNo, nextJournalNo },
+    generatedCount,
+  };
 }
 
 /* ============================ STORAGE HELPERS ============================
@@ -170,10 +534,15 @@ function isBalanced(lines) {
 
 /* ============================ INVOICE MATH ============================ */
 
-function computeInvoiceTotals(items, discount, applyTax, taxRate) {
+function computeInvoiceTotals(items, discount, applyTax, settings) {
   const subtotal = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
   const afterDiscount = Math.max(0, subtotal - (Number(discount) || 0));
-  const tax = applyTax ? afterDiscount * (Number(taxRate) || 0) / 100 : 0;
+  let tax = 0;
+  if (applyTax) {
+    tax = settings.taxType === 'fixed'
+      ? (Number(settings.taxFixedAmount) || 0)
+      : afterDiscount * (Number(settings.taxRate) || 0) / 100;
+  }
   const total = afterDiscount + tax;
   const cost = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.cost) || 0), 0);
   return { subtotal, afterDiscount, tax, total, cost };
@@ -187,6 +556,27 @@ function getCashLikeAccountId(accounts, method) {
 
 function getAccountByKind(accounts, kind) {
   return accounts.find(a => a.kind === kind) || null;
+}
+
+// All treasury (money-holding) accounts: cash drawers, bank accounts, e-wallets.
+function getTreasuryAccounts(accounts) {
+  return accounts.filter(a => a.kind === 'cash' || a.kind === 'bank');
+}
+
+// A paymentMethod value on an invoice/expense/payment can be: 'credit', a literal
+// legacy 'cash'/'bank' (from before multi-treasury support), or a real account id.
+// This resolves it to an actual account id to post journal lines against.
+function resolveTreasuryAccountId(paymentMethod, accounts) {
+  if (paymentMethod === 'cash' || paymentMethod === 'bank') return getCashLikeAccountId(accounts, paymentMethod);
+  return paymentMethod;
+}
+
+function paymentMethodLabel(paymentMethod, accounts) {
+  if (paymentMethod === 'credit') return 'آجل';
+  if (paymentMethod === 'cash') return (getAccountByKind(accounts, 'cash') || {}).name || 'نقدي';
+  if (paymentMethod === 'bank') return (getAccountByKind(accounts, 'bank') || {}).name || 'بنك';
+  const acc = accounts.find(a => a.id === paymentMethod);
+  return acc ? acc.name : paymentMethod;
 }
 
 /* ============================== DESIGN ATOMS ============================== */
@@ -209,20 +599,21 @@ function Card({ children, className = '' }) {
   );
 }
 
-function LedgerStatCard({ icon: Icon, label, value, currency, tone = 'neutral', sub }) {
+function LedgerStatCard({ icon: Icon, label, value, currency, tone = 'neutral', sub, onClick }) {
   const iconBg = tone === 'pos' ? 'bg-emerald-100 text-emerald-700'
     : tone === 'neg' ? 'bg-rose-100 text-rose-700'
     : tone === 'warn' ? 'bg-amber-100 text-amber-700'
     : 'bg-stone-100 text-stone-600';
+  const Tag = onClick ? 'button' : 'div';
   return (
-    <div className="ledger-card rounded-lg p-4 flex flex-col gap-2 min-w-0">
+    <Tag onClick={onClick} className={classNames('ledger-card rounded-lg p-4 flex flex-col gap-2 min-w-0 text-right w-full', onClick && 'hover:shadow-md transition-shadow cursor-pointer')}>
       <div className="flex items-center justify-between">
         <span className="text-sm text-stone-500 font-body">{label}</span>
         <span className={classNames('p-1.5 rounded-md', iconBg)}><Icon size={16} /></span>
       </div>
       <Figure value={value} currency={currency} className="text-xl font-semibold text-stone-800" />
       {sub && <span className="text-xs text-stone-400 font-body">{sub}</span>}
-    </div>
+    </Tag>
   );
 }
 
@@ -348,12 +739,19 @@ function Toast({ toast }) {
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: 'لوحة التحكم', icon: LayoutDashboard },
+  { key: 'treasury', label: 'الصندوق والبنوك', icon: Landmark },
   { key: 'accounts', label: 'دليل الحسابات', icon: BookOpen },
   { key: 'customers', label: 'العملاء', icon: Users },
   { key: 'suppliers', label: 'الموردون', icon: Truck },
+  { key: 'workers', label: 'العمال والموظفون', icon: UserCog },
+  { key: 'statement', label: 'كشف حساب', icon: Receipt },
   { key: 'products', label: 'المنتجات والمخزون', icon: Package },
   { key: 'sales', label: 'فواتير المبيعات', icon: ShoppingCart },
   { key: 'purchases', label: 'فواتير المشتريات', icon: FileText },
+  { key: 'recurring', label: 'الفواتير الدورية', icon: Repeat },
+  { key: 'reminders', label: 'تذكيرات التحصيل', icon: Bell },
+  { key: 'forecast', label: 'التنبؤ بالطلب', icon: Sparkles },
+  { key: 'reps', label: 'المندوبون والعمولات', icon: Award },
   { key: 'expenses', label: 'المصاريف', icon: Wallet },
   { key: 'journal', label: 'القيود اليومية', icon: ClipboardList },
   { key: 'reports', label: 'التقارير المالية', icon: PieChart },
@@ -367,7 +765,7 @@ function Sidebar({ active, onNavigate, companyName, mobileOpen, setMobileOpen })
         <div className="fixed inset-0 z-30 md:hidden" style={{ backgroundColor: 'rgba(28,25,23,0.45)' }} onClick={() => setMobileOpen(false)} />
       )}
       <aside className={classNames(
-        'text-stone-200 w-64 shrink-0 flex flex-col fixed md:sticky top-0 h-screen z-40 transition-transform',
+        'text-stone-200 w-64 shrink-0 flex flex-col fixed md:sticky top-0 h-screen z-40 transition-transform no-print',
         mobileOpen ? 'translate-x-0' : 'translate-x-full md:translate-x-0'
       )} style={{ insetInlineStart: 0, backgroundColor: '#16241D' }}>
         <div className="px-5 py-5 border-b border-stone-700 flex items-center gap-2">
@@ -406,7 +804,7 @@ function Sidebar({ active, onNavigate, companyName, mobileOpen, setMobileOpen })
 
 function TopBar({ title, setMobileOpen, right }) {
   return (
-    <div className="flex items-center justify-between px-4 md:px-6 py-4 bg-white border-b border-stone-200 sticky top-0 z-20">
+    <div className="flex items-center justify-between px-4 md:px-6 py-4 bg-white border-b border-stone-200 sticky top-0 z-20 no-print">
       <div className="flex items-center gap-3">
         <button className="md:hidden p-1.5 rounded-md hover:bg-stone-100" onClick={() => setMobileOpen(true)}>
           <Menu size={20} />
@@ -418,19 +816,252 @@ function TopBar({ title, setMobileOpen, right }) {
   );
 }
 
+/* ============================== ACCOUNT LEDGER DRILL-DOWN ============================== */
+
+function AccountLedgerModal({ account, journalEntries, currency, onClose }) {
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState(todayISO());
+  const ledger = computeAccountLedger(account, journalEntries, from, to);
+
+  return (
+    <Modal title={`حركة حساب: ${account.name}`} onClose={onClose} width="max-w-2xl">
+      <div className="flex flex-col gap-3">
+        <div className="grid grid-cols-2 gap-3 no-print">
+          <Field label="من تاريخ">
+            <Input type="date" value={from} onChange={e => setFrom(e.target.value)} />
+          </Field>
+          <Field label="إلى تاريخ">
+            <Input type="date" value={to} onChange={e => setTo(e.target.value)} />
+          </Field>
+        </div>
+
+        <div className="print-area">
+          <div className="flex items-center justify-between mb-3 pb-3 border-b border-stone-200">
+            <p className="font-body font-medium text-stone-700">الرصيد الافتتاحي</p>
+            <Figure value={ledger.opening} currency={currency} />
+          </div>
+          {ledger.rows.length === 0 ? (
+            <p className="text-sm text-stone-400 font-body py-6 text-center">لا توجد حركات في هذه الفترة.</p>
+          ) : (
+            <table className="w-full text-sm font-body">
+              <thead>
+                <tr className="text-stone-400 text-xs border-b border-stone-100">
+                  <th className="text-right py-2 font-normal">التاريخ</th>
+                  <th className="text-right py-2 font-normal">البيان</th>
+                  <th className="text-right py-2 font-normal">مدين</th>
+                  <th className="text-right py-2 font-normal">دائن</th>
+                  <th className="text-right py-2 font-normal">الرصيد</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ledger.rows.map((r, i) => (
+                  <tr key={i} className="border-b border-stone-50">
+                    <td className="py-2 text-stone-500">{fmtDate(r.date)}</td>
+                    <td className="py-2 text-stone-700">{r.description}</td>
+                    <td className="py-2">{r.debit > 0 ? <Figure value={r.debit} /> : '-'}</td>
+                    <td className="py-2">{r.credit > 0 ? <Figure value={r.credit} /> : '-'}</td>
+                    <td className="py-2"><Figure value={r.balance} currency={currency} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          <div className="flex items-center justify-between mt-3 pt-3 border-t-2 border-stone-200 font-semibold">
+            <p className="font-body text-stone-700">الرصيد الختامي</p>
+            <Figure value={ledger.closing} currency={currency} className="text-lg" />
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-2 mt-1 no-print">
+          <Button variant="secondary" onClick={onClose}>إغلاق</Button>
+          <Button variant="outline" icon={Download} onClick={() => exportRowsToExcel(`حركة-${account.name}`, 'حركة الحساب', ledger.rows.map(r => ({
+            'التاريخ': fmtDate(r.date), 'البيان': r.description, 'مدين': r.debit, 'دائن': r.credit, 'الرصيد': r.balance,
+          })))}>تصدير Excel</Button>
+          <Button icon={Printer} onClick={() => window.print()}>طباعة / PDF</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================== TREASURY (CASH / BANK / WALLETS) ============================== */
+
+function TreasuryAccountFormModal({ onClose, onSave }) {
+  const [form, setForm] = useState({ name: '', kind: 'cash', openingBalance: 0 });
+  const canSave = form.name.trim();
+  return (
+    <Modal title="حساب صندوق/بنك جديد" onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <Field label="اسم الحساب" required hint="مثال: صندوق الفرع الرئيسي، بنك الراجحي، محفظة STC Pay">
+          <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
+        </Field>
+        <Field label="النوع" required>
+          <Select value={form.kind} onChange={e => setForm(f => ({ ...f, kind: e.target.value }))}>
+            <option value="cash">صندوق نقدي</option>
+            <option value="bank">بنك / محفظة إلكترونية</option>
+          </Select>
+        </Field>
+        <Field label="الرصيد الافتتاحي" hint="اتركه صفرًا إذا كان حسابًا جديدًا بلا رصيد سابق">
+          <Input type="number" min="0" step="0.01" dir="ltr" value={form.openingBalance} onChange={e => setForm(f => ({ ...f, openingBalance: e.target.value }))} />
+        </Field>
+        <div className="flex justify-end gap-2 mt-2">
+          <Button variant="secondary" onClick={onClose}>إلغاء</Button>
+          <Button disabled={!canSave} icon={Check} onClick={() => onSave({ ...form, openingBalance: Number(form.openingBalance) || 0 })}>حفظ</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function TreasuryTransactionModal({ account, accounts, onClose, onSave }) {
+  const offsetAccounts = accounts.filter(a => (a.type === 'equity' || a.type === 'revenue' || a.type === 'expense') && a.kind !== 'cogs');
+  const [type, setType] = useState('deposit');
+  const [amount, setAmount] = useState('');
+  const [date, setDate] = useState(todayISO());
+  const [description, setDescription] = useState('');
+  const [offsetAccountId, setOffsetAccountId] = useState(getAccountByKind(accounts, 'capital')?.id || offsetAccounts[0]?.id || '');
+  const [smsText, setSmsText] = useState('');
+
+  const canSave = Number(amount) > 0 && offsetAccountId;
+
+  return (
+    <Modal title={`تسجيل حركة - ${account.name}`} onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <Field label="نوع الحركة" required>
+          <Select value={type} onChange={e => setType(e.target.value)}>
+            <option value="deposit">إيداع / استلام مبلغ</option>
+            <option value="withdraw">سحب / صرف مبلغ</option>
+          </Select>
+        </Field>
+
+        <Field label="لصق نص رسالة (اختياري)" hint="الصق نص رسالة المحفظة أو البنك، وسيحاول النظام استخراج المبلغ تلقائيًا">
+          <Textarea rows={2} value={smsText} onChange={e => {
+            setSmsText(e.target.value);
+            const guess = extractAmountFromText(e.target.value);
+            if (guess) setAmount(guess);
+          }} placeholder="مثال: تم إيداع مبلغ 500.00 ريال في محفظتك..." />
+        </Field>
+
+        <Field label="المبلغ" required>
+          <Input type="number" min="0" step="0.01" dir="ltr" value={amount} onChange={e => setAmount(e.target.value)} />
+        </Field>
+        <Field label="التاريخ" required>
+          <Input type="date" value={date} onChange={e => setDate(e.target.value)} />
+        </Field>
+        <Field label={type === 'deposit' ? 'مصدر المبلغ' : 'وجهة الصرف'} required>
+          <Select value={offsetAccountId} onChange={e => setOffsetAccountId(e.target.value)}>
+            {offsetAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </Select>
+        </Field>
+        <Field label="وصف">
+          <Input value={description} onChange={e => setDescription(e.target.value)} placeholder="مثال: إيداع رأس مال، دفعة غير مرتبطة بفاتورة..." />
+        </Field>
+        <div className="flex justify-end gap-2 mt-2">
+          <Button variant="secondary" onClick={onClose}>إلغاء</Button>
+          <Button disabled={!canSave} icon={Check} onClick={() => onSave({
+            type, amount: Number(amount), date, description, offsetAccountId, treasuryAccountId: account.id,
+          })}>حفظ الحركة</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function TreasuryView({ accounts, journalEntries, currency, onAddAccount, onDeleteAccount, onAddTransaction }) {
+  const treasuryAccounts = getTreasuryAccounts(accounts);
+  const [showAccountForm, setShowAccountForm] = useState(false);
+  const [txFor, setTxFor] = useState(null);
+  const [ledgerFor, setLedgerFor] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(null);
+
+  const usedAccountIds = useMemo(() => {
+    const s = new Set();
+    journalEntries.forEach(je => je.lines.forEach(l => s.add(l.accountId)));
+    return s;
+  }, [journalEntries]);
+
+  const total = treasuryAccounts.reduce((s, a) => s + accountBalance(a, journalEntries).balance, 0);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-body text-stone-500">إجمالي السيولة في كل الحسابات: <Figure value={total} currency={currency} className="text-stone-700 font-medium" /></span>
+        <Button icon={Plus} onClick={() => setShowAccountForm(true)}>حساب صندوق/بنك جديد</Button>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {treasuryAccounts.map(acc => {
+          const bal = accountBalance(acc, journalEntries).balance;
+          return (
+            <Card key={acc.id} className="p-4 flex flex-col gap-3">
+              <div className="flex items-start justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="p-1.5 rounded-md bg-emerald-100 text-emerald-700">
+                    {acc.kind === 'cash' ? <Banknote size={16} /> : <Landmark size={16} />}
+                  </span>
+                  <div>
+                    <p className="font-body font-medium text-stone-800">{acc.name}</p>
+                    <p className="text-xs text-stone-400 font-body">{acc.kind === 'cash' ? 'صندوق نقدي' : 'بنك / محفظة'}</p>
+                  </div>
+                </div>
+                {!acc.system && (
+                  <IconButton icon={Trash2} variant="danger" title="حذف" onClick={() => setConfirmDel(acc)} />
+                )}
+              </div>
+              <Figure value={bal} currency={currency} className="text-xl font-semibold text-stone-800" tone={bal >= 0 ? 'pos' : 'neg'} />
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" className="flex-1" onClick={() => setLedgerFor(acc)}>عرض الحركات</Button>
+                <Button size="sm" className="flex-1" onClick={() => setTxFor(acc)}>تسجيل حركة</Button>
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+
+      {showAccountForm && (
+        <TreasuryAccountFormModal
+          onClose={() => setShowAccountForm(false)}
+          onSave={(form) => { onAddAccount(form); setShowAccountForm(false); }}
+        />
+      )}
+
+      {txFor && (
+        <TreasuryTransactionModal
+          account={txFor} accounts={accounts}
+          onClose={() => setTxFor(null)}
+          onSave={(data) => { onAddTransaction(data); setTxFor(null); }}
+        />
+      )}
+
+      {ledgerFor && (
+        <AccountLedgerModal account={ledgerFor} journalEntries={journalEntries} currency={currency} onClose={() => setLedgerFor(null)} />
+      )}
+
+      {confirmDel && (
+        <ConfirmDialog
+          title="حذف حساب"
+          message={usedAccountIds.has(confirmDel.id)
+            ? `لا يمكن حذف "${confirmDel.name}" لوجود حركات مسجلة عليه.`
+            : `هل تريد حذف "${confirmDel.name}"؟`}
+          onCancel={() => setConfirmDel(null)}
+          onConfirm={() => { if (!usedAccountIds.has(confirmDel.id)) onDeleteAccount(confirmDel.id); setConfirmDel(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
 /* ============================== DASHBOARD ============================== */
 
 function DashboardView({ data, currency, onNavigate }) {
   const { accounts, journalEntries, salesInvoices, purchaseInvoices, products, customers, suppliers } = data;
+  const [ledgerAccount, setLedgerAccount] = useState(null);
 
-  const cash = getAccountByKind(accounts, 'cash');
-  const bank = getAccountByKind(accounts, 'bank');
+  const treasuryAccounts = getTreasuryAccounts(accounts);
   const ar = getAccountByKind(accounts, 'ar');
   const ap = getAccountByKind(accounts, 'ap');
   const inventoryAcc = getAccountByKind(accounts, 'inventory');
 
-  const cashBal = cash ? accountBalance(cash, journalEntries).balance : 0;
-  const bankBal = bank ? accountBalance(bank, journalEntries).balance : 0;
   const arBal = ar ? accountBalance(ar, journalEntries).balance : 0;
   const apBal = ap ? accountBalance(ap, journalEntries).balance : 0;
   const invBal = inventoryAcc ? accountBalance(inventoryAcc, journalEntries).balance : 0;
@@ -474,11 +1105,20 @@ function DashboardView({ data, currency, onNavigate }) {
   return (
     <div className="flex flex-col gap-5">
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
-        <LedgerStatCard icon={Banknote} label="الصندوق" value={cashBal} currency={currency} tone="pos" />
-        <LedgerStatCard icon={Landmark} label="البنك" value={bankBal} currency={currency} tone="pos" />
-        <LedgerStatCard icon={Users} label="مستحق من العملاء" value={arBal} currency={currency} tone="neutral" />
-        <LedgerStatCard icon={Truck} label="مستحق للموردين" value={apBal} currency={currency} tone="warn" />
-        <LedgerStatCard icon={Package} label="قيمة المخزون" value={invBal} currency={currency} tone="neutral" />
+        {treasuryAccounts.map(acc => (
+          <LedgerStatCard
+            key={acc.id}
+            icon={acc.kind === 'cash' ? Banknote : Landmark}
+            label={acc.name}
+            value={accountBalance(acc, journalEntries).balance}
+            currency={currency}
+            tone="pos"
+            onClick={() => setLedgerAccount(acc)}
+          />
+        ))}
+        <LedgerStatCard icon={Users} label="مستحق من العملاء" value={arBal} currency={currency} tone="neutral" onClick={() => ar && setLedgerAccount(ar)} />
+        <LedgerStatCard icon={Truck} label="مستحق للموردين" value={apBal} currency={currency} tone="warn" onClick={() => ap && setLedgerAccount(ap)} />
+        <LedgerStatCard icon={Package} label="قيمة المخزون" value={invBal} currency={currency} tone="neutral" onClick={() => inventoryAcc && setLedgerAccount(inventoryAcc)} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -486,6 +1126,10 @@ function DashboardView({ data, currency, onNavigate }) {
         <LedgerStatCard icon={TrendingDown} label="مصاريف الشهر الحالي" value={monthExpense} currency={currency} tone="neg" />
         <LedgerStatCard icon={monthProfit >= 0 ? ArrowUpRight : ArrowDownRight} label="صافي ربح الشهر" value={monthProfit} currency={currency} tone={monthProfit >= 0 ? 'pos' : 'neg'} />
       </div>
+
+      {ledgerAccount && (
+        <AccountLedgerModal account={ledgerAccount} journalEntries={journalEntries} currency={currency} onClose={() => setLedgerAccount(null)} />
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="lg:col-span-2 p-4">
@@ -695,8 +1339,8 @@ function ContactFormModal({ title, initial, onClose, onSave }) {
         <Field label="الاسم" required>
           <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
         </Field>
-        <Field label="رقم الهاتف">
-          <Input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} dir="ltr" />
+        <Field label="رقم الهاتف" hint="أدخله مع رمز الدولة بدون + أو أصفار (مثال: 9665xxxxxxxx) لتفعيل تذكيرات واتساب">
+          <Input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} dir="ltr" placeholder="9665xxxxxxxx" />
         </Field>
         <Field label="ملاحظات">
           <Textarea rows={2} value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
@@ -710,17 +1354,18 @@ function ContactFormModal({ title, initial, onClose, onSave }) {
   );
 }
 
-function PaymentFormModal({ contact, unpaidInvoices, currency, onClose, onSave }) {
+function PaymentFormModal({ contact, unpaidInvoices, accounts, currency, onClose, onSave }) {
+  const treasuryAccounts = getTreasuryAccounts(accounts);
   const [invoiceId, setInvoiceId] = useState(unpaidInvoices[0]?.id || '');
   const invoice = unpaidInvoices.find(i => i.id === invoiceId);
   const remaining = invoice ? invoice.total - invoice.paidAmount : 0;
   const [amount, setAmount] = useState(remaining);
-  const [method, setMethod] = useState('cash');
+  const [method, setMethod] = useState(treasuryAccounts[0]?.id || '');
   const [date, setDate] = useState(todayISO());
 
   useEffect(() => { setAmount(remaining); }, [invoiceId]);
 
-  const canSave = invoice && Number(amount) > 0 && Number(amount) <= remaining + 0.005;
+  const canSave = invoice && Number(amount) > 0 && Number(amount) <= remaining + 0.005 && method;
 
   return (
     <Modal title={`تسجيل دفعة - ${contact.name}`} onClose={onClose}>
@@ -741,10 +1386,9 @@ function PaymentFormModal({ contact, unpaidInvoices, currency, onClose, onSave }
             <Field label="المبلغ" required hint={`الحد الأقصى: ${fmtNum(remaining)} ${currency}`}>
               <Input type="number" min="0" step="0.01" value={amount} onChange={e => setAmount(e.target.value)} dir="ltr" />
             </Field>
-            <Field label="طريقة الدفع" required>
+            <Field label="استلمت في / دُفعت من" required>
               <Select value={method} onChange={e => setMethod(e.target.value)}>
-                <option value="cash">نقدي</option>
-                <option value="bank">بنك</option>
+                {treasuryAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
               </Select>
             </Field>
             <Field label="التاريخ" required>
@@ -763,9 +1407,10 @@ function PaymentFormModal({ contact, unpaidInvoices, currency, onClose, onSave }
   );
 }
 
-function ContactsView({ type, contacts, invoices, currency, onAdd, onUpdate, onDelete, onRecordPayment }) {
+function ContactsView({ type, contacts, invoices, currency, settings, accounts, onAdd, onUpdate, onDelete, onRecordPayment }) {
   const isCustomer = type === 'customer';
   const contactField = isCustomer ? 'customerId' : 'supplierId';
+  const today = todayISO();
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState(null);
   const [confirmDel, setConfirmDel] = useState(null);
@@ -804,13 +1449,21 @@ function ContactsView({ type, contacts, invoices, currency, onAdd, onUpdate, onD
             const bal = contactBalance(c.id);
             const unpaid = contactInvoices(c.id).filter(i => i.total - i.paidAmount > 0.005);
             const isOpen = expanded === c.id;
+            const tierInfo = isCustomer ? computeCustomerTier(c, invoices, settings, today) : null;
+            const riskInfo = isCustomer ? computeCustomerRisk(c, invoices, settings, today) : null;
             return (
               <Card key={c.id} className="overflow-hidden">
                 <div className="p-4 flex items-center justify-between gap-3 cursor-pointer" onClick={() => setExpanded(isOpen ? null : c.id)}>
                   <div className="flex items-center gap-3 min-w-0">
                     {isOpen ? <ChevronDown size={16} className="text-stone-400 shrink-0" /> : <ChevronRight size={16} className="text-stone-400 shrink-0" />}
                     <div className="min-w-0">
-                      <p className="font-body font-medium text-stone-800 truncate">{c.name}</p>
+                      <p className="font-body font-medium text-stone-800 truncate flex items-center gap-1.5">
+                        {c.name}
+                        {tierInfo && tierInfo.tier === 'vip' && <Badge tone="amber">⭐ VIP</Badge>}
+                        {riskInfo && riskInfo.level !== 'excellent' && (
+                          <Badge tone={riskInfo.level === 'poor' ? 'red' : 'amber'}>{RISK_LABELS[riskInfo.level]}</Badge>
+                        )}
+                      </p>
                       <p className="text-xs text-stone-400 font-body" dir="ltr">{c.phone}</p>
                     </div>
                   </div>
@@ -888,6 +1541,7 @@ function ContactsView({ type, contacts, invoices, currency, onAdd, onUpdate, onD
         <PaymentFormModal
           contact={payingFor}
           unpaidInvoices={contactInvoices(payingFor.id).filter(i => i.total - i.paidAmount > 0.005)}
+          accounts={accounts}
           currency={currency}
           onClose={() => setPayingFor(null)}
           onSave={(data) => { onRecordPayment(payingFor, data); setPayingFor(null); }}
@@ -899,9 +1553,11 @@ function ContactsView({ type, contacts, invoices, currency, onAdd, onUpdate, onD
 
 /* ============================== PRODUCTS ============================== */
 
-function ProductFormModal({ initial, onClose, onSave }) {
+function ProductFormModal({ initial, products, onClose, onSave }) {
   const [form, setForm] = useState(initial || { name: '', sku: '', unit: UNITS[0], costPrice: '', salePrice: '', qty: '', minQty: 5 });
-  const canSave = form.name.trim() && form.salePrice !== '';
+  const skuTrimmed = (form.sku || '').trim().toLowerCase();
+  const duplicateSku = skuTrimmed && products.some(p => p.id !== (initial && initial.id) && (p.sku || '').trim().toLowerCase() === skuTrimmed);
+  const canSave = form.name.trim() && form.salePrice !== '' && !duplicateSku;
   return (
     <Modal title={initial ? 'تعديل منتج' : 'منتج جديد'} onClose={onClose}>
       <div className="flex flex-col gap-3">
@@ -909,8 +1565,9 @@ function ProductFormModal({ initial, onClose, onSave }) {
           <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
         </Field>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="رمز الصنف (SKU)">
-            <Input value={form.sku} onChange={e => setForm(f => ({ ...f, sku: e.target.value }))} dir="ltr" />
+          <Field label="رمز الصنف (SKU)" hint={duplicateSku ? undefined : 'يجب أن يكون فريدًا لكل منتج'}>
+            <Input value={form.sku} onChange={e => setForm(f => ({ ...f, sku: e.target.value }))} dir="ltr" className={duplicateSku ? 'border-rose-400' : ''} />
+            {duplicateSku && <p className="text-xs text-rose-600 mt-1 font-body">هذا الرمز مستخدم بالفعل لمنتج آخر، اختر رمزًا مختلفًا.</p>}
           </Field>
           <Field label="وحدة القياس">
             <Select value={form.unit} onChange={e => setForm(f => ({ ...f, unit: e.target.value }))}>
@@ -1014,6 +1671,7 @@ function ProductsView({ products, currency, onAdd, onUpdate, onDelete, usedProdu
       {showForm && (
         <ProductFormModal
           initial={editing}
+          products={products}
           onClose={() => setShowForm(false)}
           onSave={(form) => { if (editing) onUpdate({ ...editing, ...form }); else onAdd(form); setShowForm(false); }}
         />
@@ -1113,7 +1771,10 @@ function ItemsEditor({ items, setItems, products, currency, priceLabel }) {
   );
 }
 
-function InvoiceTotalsBox({ totals, currency, discount, setDiscount, applyTax, setApplyTax, taxRate }) {
+function InvoiceTotalsBox({ totals, currency, discount, setDiscount, applyTax, setApplyTax, settings }) {
+  const taxLabel = settings.taxType === 'fixed'
+    ? `مبلغ ثابت ${fmtNum(settings.taxFixedAmount)} ${currency}`
+    : `${settings.taxRate}%`;
   return (
     <div className="flex flex-col gap-2 bg-stone-50 rounded-lg p-3 mt-2">
       <div className="flex items-center justify-between text-sm font-body">
@@ -1127,7 +1788,7 @@ function InvoiceTotalsBox({ totals, currency, discount, setDiscount, applyTax, s
       <label className="flex items-center justify-between text-sm font-body cursor-pointer">
         <span className="text-stone-500 flex items-center gap-1.5">
           <input type="checkbox" checked={applyTax} onChange={e => setApplyTax(e.target.checked)} />
-          ضريبة القيمة المضافة ({taxRate}%)
+          الضريبة ({taxLabel})
         </span>
         <Figure value={totals.tax} currency={currency} />
       </label>
@@ -1141,24 +1802,52 @@ function InvoiceTotalsBox({ totals, currency, discount, setDiscount, applyTax, s
 
 /* ============================== SALES INVOICES ============================== */
 
-function SalesInvoiceFormModal({ customers, products, settings, onClose, onSave }) {
+function SalesInvoiceFormModal({ customers, products, reps, salesInvoices, accounts, settings, onClose, onSave }) {
+  const today = todayISO();
+  const treasuryAccounts = getTreasuryAccounts(accounts);
   const [customerId, setCustomerId] = useState('');
-  const [date, setDate] = useState(todayISO());
+  const [date, setDate] = useState(today);
   const [items, setItems] = useState([emptyItem()]);
   const [discount, setDiscount] = useState(0);
+  const [discountTouched, setDiscountTouched] = useState(false);
   const [applyTax, setApplyTax] = useState(true);
-  const [paymentMethod, setPaymentMethod] = useState('cash');
+  const [paymentMethod, setPaymentMethod] = useState(treasuryAccounts[0]?.id || 'credit');
+  const [repId, setRepId] = useState('');
+  const [overrideBlock, setOverrideBlock] = useState(false);
+
+  const customer = customers.find(c => c.id === customerId) || null;
+  const { tier } = computeCustomerTier(customer, salesInvoices, settings, today);
+  const risk = computeCustomerRisk(customer, salesInvoices, settings, today);
+  const isVip = tier === 'vip';
+  const creditBlocked = customer && risk.level === 'poor';
 
   const validItems = items.filter(it => (it.name || products.find(p => p.id === it.productId)) && Number(it.qty) > 0);
-  const totals = computeInvoiceTotals(validItems, discount, applyTax, settings.taxRate);
-  const canSave = validItems.length > 0 && totals.total > 0 && (paymentMethod !== 'credit' || customerId);
+  const rawTotals = computeInvoiceTotals(validItems, 0, applyTax, settings);
+
+  // Auto-apply the VIP discount (once, unless the user has manually edited the discount field)
+  useEffect(() => {
+    if (isVip && !discountTouched && settings.vipDiscountPercent > 0) {
+      setDiscount(Number((rawTotals.subtotal * settings.vipDiscountPercent / 100).toFixed(2)));
+    }
+    if (!isVip && !discountTouched) {
+      setDiscount(0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isVip, rawTotals.subtotal, settings.vipDiscountPercent]);
+
+  const totals = computeInvoiceTotals(validItems, discount, applyTax, settings);
+  const creditAllowed = paymentMethod !== 'credit' || (!creditBlocked || overrideBlock);
+  const canSave = validItems.length > 0 && totals.total > 0 && (paymentMethod !== 'credit' || customerId) && creditAllowed;
+
+  const rep = reps.find(r => r.id === repId) || null;
+  const commissionPreview = rep ? totals.afterDiscount * (Number(rep.commissionPercent) || 0) / 100 : 0;
 
   return (
     <Modal title="فاتورة مبيعات جديدة" onClose={onClose} width="max-w-2xl">
       <div className="flex flex-col gap-3">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Field label="العميل" hint={paymentMethod === 'credit' ? 'مطلوب للبيع الآجل' : 'اتركه فارغًا لعميل نقدي'}>
-            <Select value={customerId} onChange={e => setCustomerId(e.target.value)}>
+            <Select value={customerId} onChange={e => { setCustomerId(e.target.value); setOverrideBlock(false); }}>
               <option value="">عميل نقدي</option>
               {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
             </Select>
@@ -1168,20 +1857,48 @@ function SalesInvoiceFormModal({ customers, products, settings, onClose, onSave 
           </Field>
         </div>
 
+        {customer && (
+          <div className="flex flex-wrap items-center gap-2">
+            {isVip && <Badge tone="amber">⭐ عميل VIP - خصم {settings.vipDiscountPercent}% مُفعّل تلقائيًا</Badge>}
+            <Badge tone={risk.level === 'excellent' ? 'green' : risk.level === 'fair' ? 'amber' : 'red'}>
+              التصنيف الائتماني: {RISK_LABELS[risk.level]}
+            </Badge>
+          </div>
+        )}
+
         <Field label="طريقة الدفع" required>
           <Select value={paymentMethod} onChange={e => setPaymentMethod(e.target.value)}>
-            <option value="cash">نقدي (الصندوق)</option>
-            <option value="bank">تحويل بنكي</option>
+            {treasuryAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
             <option value="credit">آجل (على حساب العميل)</option>
           </Select>
         </Field>
+
+        {paymentMethod === 'credit' && creditBlocked && (
+          <div className="flex flex-col gap-2 bg-rose-50 text-rose-700 rounded-md px-3 py-2.5 text-sm font-body">
+            <span className="flex items-center gap-1.5"><AlertTriangle size={15} /> البيع الآجل محظور لهذا العميل ({risk.overdueCount} فاتورة متأخرة بقيمة {fmtNum(risk.overdueAmount)} {settings.currency})</span>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={overrideBlock} onChange={e => setOverrideBlock(e.target.checked)} />
+              تجاوز الحظر والبيع له آجلاً على مسؤوليتي
+            </label>
+          </div>
+        )}
+
+        {reps.length > 0 && (
+          <Field label="المندوب / مصدر البيع" hint="اختياري - لاحتساب العمولة">
+            <Select value={repId} onChange={e => setRepId(e.target.value)}>
+              <option value="">بدون مندوب</option>
+              {reps.map(r => <option key={r.id} value={r.id}>{r.name} (عمولة {r.commissionPercent}%)</option>)}
+            </Select>
+            {rep && <p className="text-xs text-emerald-700 mt-1">عمولة تقديرية لهذه الفاتورة: {fmtNum(commissionPreview)} {settings.currency}</p>}
+          </Field>
+        )}
 
         <div>
           <p className="text-sm font-body text-stone-600 mb-1">بنود الفاتورة</p>
           <ItemsEditor items={items} setItems={setItems} products={products} currency={settings.currency} priceLabel="سعر البيع" />
         </div>
 
-        <InvoiceTotalsBox totals={totals} currency={settings.currency} discount={discount} setDiscount={setDiscount} applyTax={applyTax} setApplyTax={setApplyTax} taxRate={settings.taxRate} />
+        <InvoiceTotalsBox totals={totals} currency={settings.currency} discount={discount} setDiscount={(v) => { setDiscount(v); setDiscountTouched(true); }} applyTax={applyTax} setApplyTax={setApplyTax} settings={settings} />
 
         <div className="flex justify-end gap-2 mt-1">
           <Button variant="secondary" onClick={onClose}>إلغاء</Button>
@@ -1191,6 +1908,8 @@ function SalesInvoiceFormModal({ customers, products, settings, onClose, onSave 
               name: it.name || (products.find(p => p.id === it.productId)?.name) || 'بند',
               qty: Number(it.qty), price: Number(it.price) || 0, cost: Number(it.cost) || 0,
             })), discount: Number(discount) || 0, applyTax, paymentMethod,
+            dueDate: addDays(date, settings.defaultPaymentTermsDays),
+            repId: repId || null, isVipSale: isVip,
           })}>حفظ الفاتورة</Button>
         </div>
       </div>
@@ -1239,6 +1958,9 @@ function InvoiceDetailModal({ invoice, contact, contactLabel, currency, accountL
           <p className="font-semibold text-base">الإجمالي: <Figure value={invoice.total} currency={currency} /></p>
           <p className="text-stone-500">المدفوع: <Figure value={invoice.paidAmount} currency={currency} /></p>
           <p className="text-stone-500">المتبقي: <Figure value={invoice.total - invoice.paidAmount} currency={currency} /></p>
+          {invoice.dueDate && invoice.total - invoice.paidAmount > 0.005 && (
+            <p className="text-stone-500">تاريخ الاستحقاق: {fmtDate(invoice.dueDate)}</p>
+          )}
         </div>
       </div>
       <div className="flex justify-end gap-2 mt-4 no-print">
@@ -1249,10 +1971,11 @@ function InvoiceDetailModal({ invoice, contact, contactLabel, currency, accountL
   );
 }
 
-function SalesInvoicesView({ invoices, customers, products, settings, onAdd }) {
+function SalesInvoicesView({ invoices, customers, products, reps, accounts, settings, onAdd }) {
   const [showForm, setShowForm] = useState(false);
   const [viewing, setViewing] = useState(null);
   const sorted = [...invoices].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const today = todayISO();
 
   return (
     <div className="flex flex-col gap-4">
@@ -1280,14 +2003,24 @@ function SalesInvoicesView({ invoices, customers, products, settings, onAdd }) {
               {sorted.map(inv => {
                 const cust = customers.find(c => c.id === inv.customerId);
                 const remaining = inv.total - inv.paidAmount;
+                const overdue = remaining > 0.005 && inv.dueDate && inv.dueDate < today;
                 return (
                   <tr key={inv.id} className="border-b border-stone-50 hover:bg-stone-50 cursor-pointer" onClick={() => setViewing(inv)}>
                     <td className="py-2 text-stone-600">#{inv.no}</td>
                     <td className="py-2 text-stone-600">{fmtDate(inv.date)}</td>
-                    <td className="py-2 text-stone-700">{cust ? cust.name : 'عميل نقدي'}</td>
-                    <td className="py-2"><Badge>{PAYMENT_METHOD_LABELS[inv.paymentMethod]}</Badge></td>
+                    <td className="py-2 text-stone-700">
+                      {cust ? cust.name : 'عميل نقدي'}
+                      {inv.isVipSale && <span className="text-amber-500"> ⭐</span>}
+                    </td>
+                    <td className="py-2"><Badge>{paymentMethodLabel(inv.paymentMethod, accounts)}</Badge></td>
                     <td className="py-2"><Figure value={inv.total} currency={settings.currency} /></td>
-                    <td className="py-2">{remaining <= 0.005 ? <Badge tone="green">مدفوعة</Badge> : <Badge tone="amber">متبقي {fmtNum(remaining)}</Badge>}</td>
+                    <td className="py-2">
+                      {remaining <= 0.005
+                        ? <Badge tone="green">مدفوعة</Badge>
+                        : overdue
+                          ? <Badge tone="red">متأخرة ({fmtNum(remaining)})</Badge>
+                          : <Badge tone="amber">متبقي {fmtNum(remaining)}</Badge>}
+                    </td>
                   </tr>
                 );
               })}
@@ -1298,7 +2031,7 @@ function SalesInvoicesView({ invoices, customers, products, settings, onAdd }) {
 
       {showForm && (
         <SalesInvoiceFormModal
-          customers={customers} products={products} settings={settings}
+          customers={customers} products={products} reps={reps} salesInvoices={invoices} accounts={accounts} settings={settings}
           onClose={() => setShowForm(false)}
           onSave={(data) => { onAdd(data); setShowForm(false); }}
         />
@@ -1319,17 +2052,66 @@ function SalesInvoicesView({ invoices, customers, products, settings, onAdd }) {
 
 /* ============================== PURCHASE INVOICES ============================== */
 
-function PurchaseInvoiceFormModal({ suppliers, products, settings, onClose, onSave }) {
-  const [supplierId, setSupplierId] = useState(suppliers[0]?.id || '');
-  const [date, setDate] = useState(todayISO());
-  const [items, setItems] = useState([emptyItem()]);
-  const [discount, setDiscount] = useState(0);
-  const [applyTax, setApplyTax] = useState(true);
-  const [paymentMethod, setPaymentMethod] = useState('cash');
+function emptyPurchaseBlock(suppliers) {
+  return { rowId: uid('pb'), supplierId: suppliers[0]?.id || '', items: [emptyItem()], discount: 0, applyTax: true, paymentMethod: '' };
+}
 
-  const validItems = items.filter(it => (it.name || products.find(p => p.id === it.productId)) && Number(it.qty) > 0);
-  const totals = computeInvoiceTotals(validItems, discount, applyTax, settings.taxRate);
-  const canSave = validItems.length > 0 && totals.total > 0 && supplierId;
+function PurchaseBlock({ block, index, suppliers, products, accounts, settings, onChange, onRemove, showRemove }) {
+  const treasuryAccounts = getTreasuryAccounts(accounts);
+  const paymentMethod = block.paymentMethod || treasuryAccounts[0]?.id || 'credit';
+  const validItems = block.items.filter(it => (it.name || products.find(p => p.id === it.productId)) && Number(it.qty) > 0);
+  const totals = computeInvoiceTotals(validItems, block.discount, block.applyTax, settings);
+
+  return (
+    <div className="border border-stone-200 rounded-lg p-3.5 flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-body font-semibold text-stone-600">مورد #{index + 1}</p>
+        {showRemove && <IconButton icon={Trash2} variant="danger" title="حذف هذا المورد من الفاتورة" onClick={onRemove} />}
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <Field label="المورد" required>
+          <Select value={block.supplierId} onChange={e => onChange({ ...block, supplierId: e.target.value })}>
+            {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </Select>
+        </Field>
+        <Field label="طريقة الدفع" required>
+          <Select value={paymentMethod} onChange={e => onChange({ ...block, paymentMethod: e.target.value })}>
+            {treasuryAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            <option value="credit">آجل (على حساب المورد)</option>
+          </Select>
+        </Field>
+      </div>
+      <div>
+        <p className="text-sm font-body text-stone-600 mb-1">بنود هذا المورد</p>
+        <ItemsEditor items={block.items} setItems={(items) => onChange({ ...block, items })} products={products} currency={settings.currency} priceLabel="سعر الشراء" />
+      </div>
+      <InvoiceTotalsBox
+        totals={totals} currency={settings.currency} discount={block.discount}
+        setDiscount={(v) => onChange({ ...block, discount: v })}
+        applyTax={block.applyTax} setApplyTax={(v) => onChange({ ...block, applyTax: v })}
+        settings={settings}
+      />
+    </div>
+  );
+}
+
+function PurchaseInvoiceFormModal({ suppliers, products, accounts, settings, onClose, onSave }) {
+  const [date, setDate] = useState(todayISO());
+  const [blocks, setBlocks] = useState([emptyPurchaseBlock(suppliers)]);
+
+  const updateBlock = (rowId, next) => setBlocks(blocks.map(b => b.rowId === rowId ? next : b));
+  const removeBlock = (rowId) => setBlocks(blocks.filter(b => b.rowId !== rowId));
+  const addBlock = () => setBlocks([...blocks, emptyPurchaseBlock(suppliers)]);
+
+  const treasuryAccounts = getTreasuryAccounts(accounts);
+  const preparedInvoices = blocks.map(b => {
+    const validItems = b.items.filter(it => (it.name || products.find(p => p.id === it.productId)) && Number(it.qty) > 0);
+    const totals = computeInvoiceTotals(validItems, b.discount, b.applyTax, settings);
+    return { block: b, validItems, totals };
+  }).filter(p => p.block.supplierId && p.validItems.length > 0 && p.totals.total > 0);
+
+  const grandTotal = preparedInvoices.reduce((s, p) => s + p.totals.total, 0);
+  const canSave = preparedInvoices.length > 0;
 
   return (
     <Modal title="فاتورة مشتريات جديدة" onClose={onClose} width="max-w-2xl">
@@ -1338,41 +2120,44 @@ function PurchaseInvoiceFormModal({ suppliers, products, settings, onClose, onSa
           <p className="text-sm font-body text-rose-600">أضف موردًا واحدًا على الأقل قبل تسجيل فاتورة مشتريات.</p>
         ) : (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <Field label="المورد" required>
-                <Select value={supplierId} onChange={e => setSupplierId(e.target.value)}>
-                  {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                </Select>
-              </Field>
-              <Field label="التاريخ" required>
-                <Input type="date" value={date} onChange={e => setDate(e.target.value)} />
-              </Field>
-            </div>
-
-            <Field label="طريقة الدفع" required>
-              <Select value={paymentMethod} onChange={e => setPaymentMethod(e.target.value)}>
-                <option value="cash">نقدي (الصندوق)</option>
-                <option value="bank">تحويل بنكي</option>
-                <option value="credit">آجل (على حساب المورد)</option>
-              </Select>
+            <Field label="التاريخ (لكل الموردين في هذه الفاتورة)" required>
+              <Input type="date" value={date} onChange={e => setDate(e.target.value)} />
             </Field>
 
-            <div>
-              <p className="text-sm font-body text-stone-600 mb-1">بنود الفاتورة</p>
-              <ItemsEditor items={items} setItems={setItems} products={products} currency={settings.currency} priceLabel="سعر الشراء" />
-            </div>
+            <p className="text-xs text-stone-400 font-body -mt-1">يمكنك إضافة أكثر من مورد في نفس الفاتورة - كل مورد وأصنافه في قسم منفصل، وسيتم إنشاء فاتورة مستقلة تلقائيًا لكل مورد عند الحفظ.</p>
 
-            <InvoiceTotalsBox totals={totals} currency={settings.currency} discount={discount} setDiscount={setDiscount} applyTax={applyTax} setApplyTax={setApplyTax} taxRate={settings.taxRate} />
+            {blocks.map((b, i) => (
+              <PurchaseBlock
+                key={b.rowId} block={b} index={i} suppliers={suppliers} products={products} accounts={accounts} settings={settings}
+                onChange={(next) => updateBlock(b.rowId, next)}
+                onRemove={() => removeBlock(b.rowId)}
+                showRemove={blocks.length > 1}
+              />
+            ))}
+
+            <Button size="sm" variant="outline" icon={Plus} onClick={addBlock} className="self-start">إضافة مورد آخر لنفس الفاتورة</Button>
+
+            {preparedInvoices.length > 1 && (
+              <div className="flex items-center justify-between bg-emerald-50 text-emerald-700 rounded-md px-3 py-2 text-sm font-body font-medium">
+                <span>الإجمالي الكلي ({preparedInvoices.length} موردين)</span>
+                <Figure value={grandTotal} currency={settings.currency} />
+              </div>
+            )}
 
             <div className="flex justify-end gap-2 mt-1">
               <Button variant="secondary" onClick={onClose}>إلغاء</Button>
-              <Button disabled={!canSave} icon={Check} onClick={() => onSave({
-                supplierId, date, items: validItems.map(it => ({
+              <Button disabled={!canSave} icon={Check} onClick={() => onSave(preparedInvoices.map(p => ({
+                supplierId: p.block.supplierId, date,
+                items: p.validItems.map(it => ({
                   productId: it.productId || null,
-                  name: it.name || (products.find(p => p.id === it.productId)?.name) || 'بند',
+                  name: it.name || (products.find(pr => pr.id === it.productId)?.name) || 'بند',
                   qty: Number(it.qty), price: Number(it.price) || 0,
-                })), discount: Number(discount) || 0, applyTax, paymentMethod,
-              })}>حفظ الفاتورة</Button>
+                })),
+                discount: Number(p.block.discount) || 0, applyTax: p.block.applyTax,
+                paymentMethod: p.block.paymentMethod || treasuryAccounts[0]?.id || 'credit',
+              })))}>
+                {preparedInvoices.length > 1 ? `حفظ ${preparedInvoices.length} فواتير` : 'حفظ الفاتورة'}
+              </Button>
             </div>
           </>
         )}
@@ -1381,7 +2166,7 @@ function PurchaseInvoiceFormModal({ suppliers, products, settings, onClose, onSa
   );
 }
 
-function PurchaseInvoicesView({ invoices, suppliers, products, settings, onAdd }) {
+function PurchaseInvoicesView({ invoices, suppliers, products, accounts, settings, onAdd }) {
   const [showForm, setShowForm] = useState(false);
   const [viewing, setViewing] = useState(null);
   const sorted = [...invoices].sort((a, b) => (a.date < b.date ? 1 : -1));
@@ -1417,7 +2202,7 @@ function PurchaseInvoicesView({ invoices, suppliers, products, settings, onAdd }
                     <td className="py-2 text-stone-600">#{inv.no}</td>
                     <td className="py-2 text-stone-600">{fmtDate(inv.date)}</td>
                     <td className="py-2 text-stone-700">{sup ? sup.name : '-'}</td>
-                    <td className="py-2"><Badge>{PAYMENT_METHOD_LABELS[inv.paymentMethod]}</Badge></td>
+                    <td className="py-2"><Badge>{paymentMethodLabel(inv.paymentMethod, accounts)}</Badge></td>
                     <td className="py-2"><Figure value={inv.total} currency={settings.currency} /></td>
                     <td className="py-2">{remaining <= 0.005 ? <Badge tone="green">مسددة</Badge> : <Badge tone="amber">متبقي {fmtNum(remaining)}</Badge>}</td>
                   </tr>
@@ -1430,9 +2215,9 @@ function PurchaseInvoicesView({ invoices, suppliers, products, settings, onAdd }
 
       {showForm && (
         <PurchaseInvoiceFormModal
-          suppliers={suppliers} products={products} settings={settings}
+          suppliers={suppliers} products={products} accounts={accounts} settings={settings}
           onClose={() => setShowForm(false)}
-          onSave={(data) => { onAdd(data); setShowForm(false); }}
+          onSave={(dataArray) => { onAdd(dataArray); setShowForm(false); }}
         />
       )}
 
@@ -1451,11 +2236,12 @@ function PurchaseInvoicesView({ invoices, suppliers, products, settings, onAdd }
 
 /* ============================== EXPENSES ============================== */
 
-function ExpenseFormModal({ expenseAccounts, onClose, onSave }) {
+function ExpenseFormModal({ expenseAccounts, accounts, onClose, onSave }) {
+  const treasuryAccounts = getTreasuryAccounts(accounts);
   const [form, setForm] = useState({
-    date: todayISO(), accountId: expenseAccounts[0]?.id || '', amount: '', description: '', paymentMethod: 'cash',
+    date: todayISO(), accountId: expenseAccounts[0]?.id || '', amount: '', description: '', paymentMethod: treasuryAccounts[0]?.id || '',
   });
-  const canSave = form.accountId && Number(form.amount) > 0;
+  const canSave = form.accountId && Number(form.amount) > 0 && form.paymentMethod;
   return (
     <Modal title="مصروف جديد" onClose={onClose}>
       <div className="flex flex-col gap-3">
@@ -1470,10 +2256,9 @@ function ExpenseFormModal({ expenseAccounts, onClose, onSave }) {
         <Field label="المبلغ" required>
           <Input type="number" min="0" step="0.01" dir="ltr" value={form.amount} onChange={e => setForm(f => ({ ...f, amount: e.target.value }))} />
         </Field>
-        <Field label="طريقة الدفع" required>
+        <Field label="دُفع من" required>
           <Select value={form.paymentMethod} onChange={e => setForm(f => ({ ...f, paymentMethod: e.target.value }))}>
-            <option value="cash">نقدي (الصندوق)</option>
-            <option value="bank">بنك</option>
+            {treasuryAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
           </Select>
         </Field>
         <Field label="وصف">
@@ -1524,7 +2309,7 @@ function ExpensesView({ expenses, accounts, settings, onAdd }) {
                     <td className="py-2 text-stone-600">{fmtDate(e.date)}</td>
                     <td className="py-2 text-stone-700">{acc ? acc.name : '-'}</td>
                     <td className="py-2 text-stone-500">{e.description || '-'}</td>
-                    <td className="py-2"><Badge>{PAYMENT_METHOD_LABELS[e.paymentMethod]}</Badge></td>
+                    <td className="py-2"><Badge>{paymentMethodLabel(e.paymentMethod, accounts)}</Badge></td>
                     <td className="py-2"><Figure value={e.amount} currency={settings.currency} tone="neg" /></td>
                   </tr>
                 );
@@ -1537,6 +2322,7 @@ function ExpensesView({ expenses, accounts, settings, onAdd }) {
       {showForm && (
         <ExpenseFormModal
           expenseAccounts={expenseAccounts}
+          accounts={accounts}
           onClose={() => setShowForm(false)}
           onSave={(data) => { onAdd(data); setShowForm(false); }}
         />
@@ -1705,7 +2491,700 @@ function JournalView({ journalEntries, accounts, currency, onAddManual }) {
   );
 }
 
+/* ============================== DISTRIBUTORS / REPS & COMMISSIONS ============================== */
+
+function RepFormModal({ initial, onClose, onSave }) {
+  const [form, setForm] = useState(initial || { name: '', phone: '', commissionPercent: 2 });
+  const canSave = form.name.trim() && form.commissionPercent !== '';
+  return (
+    <Modal title={initial ? 'تعديل مندوب' : 'مندوب جديد'} onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <Field label="اسم المندوب" required>
+          <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
+        </Field>
+        <Field label="رقم الهاتف">
+          <Input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} dir="ltr" placeholder="9665xxxxxxxx" />
+        </Field>
+        <Field label="نسبة العمولة (%)" required hint="من صافي كل فاتورة (بعد الخصم، قبل الضريبة) يتم بيعها بواسطته">
+          <Input type="number" min="0" step="0.1" dir="ltr" value={form.commissionPercent} onChange={e => setForm(f => ({ ...f, commissionPercent: e.target.value }))} />
+        </Field>
+        <div className="flex justify-end gap-2 mt-2">
+          <Button variant="secondary" onClick={onClose}>إلغاء</Button>
+          <Button disabled={!canSave} icon={Check} onClick={() => onSave({ ...form, commissionPercent: Number(form.commissionPercent) })}>حفظ</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function RepsView({ reps, salesInvoices, currency, onAdd, onUpdate, onDelete }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(null);
+  const [expanded, setExpanded] = useState(null);
+
+  const now = new Date();
+  const monthStart = `${now.getFullYear()}-${pad(now.getMonth() + 1, 2)}-01`;
+
+  const repInvoices = (repId) => salesInvoices.filter(inv => inv.repId === repId);
+  const repMonthStats = (repId) => {
+    const list = repInvoices(repId).filter(inv => inv.date >= monthStart);
+    return {
+      count: list.length,
+      sales: list.reduce((s, inv) => s + inv.total, 0),
+      commission: list.reduce((s, inv) => s + (inv.commissionAmount || 0), 0),
+    };
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-body text-stone-500">لوحة المندوبين تربط كل عملية بيع بعمولة فورية - أساس نظام "الأداء مقابل الدخل".</p>
+        <Button icon={Plus} onClick={() => { setEditing(null); setShowForm(true); }}>مندوب جديد</Button>
+      </div>
+
+      {reps.length === 0 ? (
+        <Card className="p-4">
+          <EmptyState icon={Users} title="لا يوجد مندوبون بعد" hint="أضف مندوبي المبيعات لتفعيل احتساب العمولة التلقائي على كل فاتورة." />
+        </Card>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {reps.map(rep => {
+            const stats = repMonthStats(rep.id);
+            const isOpen = expanded === rep.id;
+            return (
+              <Card key={rep.id} className="overflow-hidden">
+                <div className="p-4 flex items-center justify-between gap-3 cursor-pointer" onClick={() => setExpanded(isOpen ? null : rep.id)}>
+                  <div className="flex items-center gap-3 min-w-0">
+                    {isOpen ? <ChevronDown size={16} className="text-stone-400 shrink-0" /> : <ChevronRight size={16} className="text-stone-400 shrink-0" />}
+                    <div className="min-w-0">
+                      <p className="font-body font-medium text-stone-800">{rep.name}</p>
+                      <p className="text-xs text-stone-400 font-body">عمولة {rep.commissionPercent}% لكل فاتورة</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-4 shrink-0">
+                    <div className="text-left">
+                      <p className="text-xs text-stone-400 font-body">عمولة هذا الشهر</p>
+                      <Figure value={stats.commission} currency={currency} className="text-emerald-700 font-semibold" />
+                    </div>
+                    <IconButton icon={Pencil} title="تعديل" onClick={(e) => { e.stopPropagation(); setEditing(rep); setShowForm(true); }} />
+                    <IconButton icon={Trash2} variant="danger" title="حذف" onClick={(e) => { e.stopPropagation(); setConfirmDel(rep); }} />
+                  </div>
+                </div>
+                {isOpen && (
+                  <div className="border-t border-stone-100 p-4">
+                    <div className="grid grid-cols-3 gap-3 mb-3">
+                      <div><p className="text-xs text-stone-400 font-body">عدد الفواتير</p><p className="font-body font-medium">{stats.count}</p></div>
+                      <div><p className="text-xs text-stone-400 font-body">إجمالي المبيعات</p><Figure value={stats.sales} currency={currency} /></div>
+                      <div><p className="text-xs text-stone-400 font-body">العمولة المستحقة</p><Figure value={stats.commission} currency={currency} tone="pos" /></div>
+                    </div>
+                    {repInvoices(rep.id).length === 0 ? (
+                      <p className="text-sm text-stone-400 font-body">لا توجد فواتير لهذا المندوب بعد.</p>
+                    ) : (
+                      <table className="w-full text-sm font-body">
+                        <thead>
+                          <tr className="text-stone-400 text-xs">
+                            <th className="text-right py-1.5 font-normal">رقم</th>
+                            <th className="text-right py-1.5 font-normal">التاريخ</th>
+                            <th className="text-right py-1.5 font-normal">قيمة الفاتورة</th>
+                            <th className="text-right py-1.5 font-normal">العمولة</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...repInvoices(rep.id)].sort((a, b) => a.date < b.date ? 1 : -1).slice(0, 20).map(inv => (
+                            <tr key={inv.id} className="border-t border-stone-50">
+                              <td className="py-1.5 text-stone-500">#{inv.no}</td>
+                              <td className="py-1.5 text-stone-500">{fmtDate(inv.date)}</td>
+                              <td className="py-1.5"><Figure value={inv.total} currency={currency} /></td>
+                              <td className="py-1.5"><Figure value={inv.commissionAmount || 0} currency={currency} tone="pos" /></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
+      {showForm && (
+        <RepFormModal
+          initial={editing}
+          onClose={() => setShowForm(false)}
+          onSave={(form) => { if (editing) onUpdate({ ...editing, ...form }); else onAdd(form); setShowForm(false); }}
+        />
+      )}
+
+      {confirmDel && (
+        <ConfirmDialog
+          title="حذف مندوب"
+          message={`هل تريد حذف "${confirmDel.name}"؟ الفواتير السابقة المرتبطة به تبقى محفوظة في السجل.`}
+          onCancel={() => setConfirmDel(null)}
+          onConfirm={() => { onDelete(confirmDel.id); setConfirmDel(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ============================== WORKERS / EMPLOYEES ============================== */
+
+function WorkerFormModal({ initial, onClose, onSave }) {
+  const [form, setForm] = useState(initial || { name: '', phone: '', dailyWage: '', maxDailyWithdrawal: '', notes: '' });
+  const canSave = form.name.trim();
+  return (
+    <Modal title={initial ? 'تعديل بيانات عامل' : 'عامل / موظف جديد'} onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <Field label="الاسم" required>
+          <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
+        </Field>
+        <Field label="رقم الهاتف">
+          <Input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} dir="ltr" placeholder="9665xxxxxxxx" />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="الأجر اليومي">
+            <Input type="number" min="0" step="0.01" dir="ltr" value={form.dailyWage} onChange={e => setForm(f => ({ ...f, dailyWage: e.target.value }))} />
+          </Field>
+          <Field label="الحد الأعلى للسحب اليومي">
+            <Input type="number" min="0" step="0.01" dir="ltr" value={form.maxDailyWithdrawal} onChange={e => setForm(f => ({ ...f, maxDailyWithdrawal: e.target.value }))} />
+          </Field>
+        </div>
+        <Field label="ملاحظات">
+          <Textarea rows={2} value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
+        </Field>
+        <div className="flex justify-end gap-2 mt-2">
+          <Button variant="secondary" onClick={onClose}>إلغاء</Button>
+          <Button disabled={!canSave} icon={Check} onClick={() => onSave({
+            ...form, dailyWage: Number(form.dailyWage) || 0, maxDailyWithdrawal: Number(form.maxDailyWithdrawal) || 0,
+          })}>حفظ</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function WorkersView({ workers, currency, onAdd, onUpdate, onDelete }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(null);
+  const [search, setSearch] = useState('');
+
+  const filtered = workers.filter(w => w.name.includes(search) || (w.phone || '').includes(search));
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
+        <div className="relative w-full sm:max-w-xs">
+          <Search size={15} className="absolute top-1/2 -translate-y-1/2 right-3 text-stone-400" />
+          <Input value={search} onChange={e => setSearch(e.target.value)} placeholder="بحث بالاسم أو الهاتف" className="pr-9" />
+        </div>
+        <Button icon={Plus} onClick={() => { setEditing(null); setShowForm(true); }}>عامل / موظف جديد</Button>
+      </div>
+
+      {filtered.length === 0 ? (
+        <Card className="p-4">
+          <EmptyState icon={UserCog} title="لا يوجد عمال أو موظفون بعد" hint="أضف بيانات العمال والموظفين لتتبع أجورهم وحدود السحب اليومي." />
+        </Card>
+      ) : (
+        <Card className="overflow-x-auto p-4">
+          <table className="w-full text-sm font-body">
+            <thead>
+              <tr className="text-stone-400 text-xs border-b border-stone-100">
+                <th className="text-right py-2 font-normal">الاسم</th>
+                <th className="text-right py-2 font-normal">الهاتف</th>
+                <th className="text-right py-2 font-normal">الأجر اليومي</th>
+                <th className="text-right py-2 font-normal">حد السحب اليومي</th>
+                <th className="text-right py-2 font-normal">ملاحظات</th>
+                <th className="text-right py-2 font-normal"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(w => (
+                <tr key={w.id} className="border-b border-stone-50 hover:bg-stone-50">
+                  <td className="py-2 text-stone-700">{w.name}</td>
+                  <td className="py-2 text-stone-500" dir="ltr">{w.phone}</td>
+                  <td className="py-2"><Figure value={w.dailyWage} currency={currency} /></td>
+                  <td className="py-2"><Figure value={w.maxDailyWithdrawal} currency={currency} /></td>
+                  <td className="py-2 text-stone-500 truncate" style={{ maxWidth: 200 }}>{w.notes || '-'}</td>
+                  <td className="py-2 flex gap-1">
+                    <IconButton icon={Pencil} title="تعديل" onClick={() => { setEditing(w); setShowForm(true); }} />
+                    <IconButton icon={Trash2} variant="danger" title="حذف" onClick={() => setConfirmDel(w)} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {showForm && (
+        <WorkerFormModal
+          initial={editing}
+          onClose={() => setShowForm(false)}
+          onSave={(form) => { if (editing) onUpdate({ ...editing, ...form }); else onAdd(form); setShowForm(false); }}
+        />
+      )}
+
+      {confirmDel && (
+        <ConfirmDialog
+          title="حذف"
+          message={`هل تريد حذف "${confirmDel.name}"؟`}
+          onCancel={() => setConfirmDel(null)}
+          onConfirm={() => { onDelete(confirmDel.id); setConfirmDel(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ============================== RECURRING INVOICES ============================== */
+
+function RecurringFormModal({ customers, products, reps, accounts, settings, onClose, onSave }) {
+  const treasuryAccounts = getTreasuryAccounts(accounts);
+  const [name, setName] = useState('');
+  const [customerId, setCustomerId] = useState(customers[0]?.id || '');
+  const [items, setItems] = useState([emptyItem()]);
+  const [discount, setDiscount] = useState(0);
+  const [applyTax, setApplyTax] = useState(true);
+  const [paymentMethod, setPaymentMethod] = useState('credit');
+  const [frequency, setFrequency] = useState('monthly');
+  const [startDate, setStartDate] = useState(todayISO());
+  const [repId, setRepId] = useState('');
+
+  const validItems = items.filter(it => (it.name || products.find(p => p.id === it.productId)) && Number(it.qty) > 0);
+  const totals = computeInvoiceTotals(validItems, discount, applyTax, settings);
+  const canSave = customerId && validItems.length > 0 && totals.total > 0 && name.trim();
+
+  return (
+    <Modal title="فاتورة دورية جديدة" onClose={onClose} width="max-w-2xl">
+      <div className="flex flex-col gap-3">
+        {customers.length === 0 ? (
+          <p className="text-sm font-body text-rose-600">أضف عميلاً واحدًا على الأقل أولاً.</p>
+        ) : (
+          <>
+            <Field label="اسم/وصف الاشتراك" required hint="مثال: اشتراك شهري - صيانة">
+              <Input value={name} onChange={e => setName(e.target.value)} />
+            </Field>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Field label="العميل" required>
+                <Select value={customerId} onChange={e => setCustomerId(e.target.value)}>
+                  {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </Select>
+              </Field>
+              <Field label="التكرار" required>
+                <Select value={frequency} onChange={e => setFrequency(e.target.value)}>
+                  <option value="weekly">أسبوعي</option>
+                  <option value="monthly">شهري</option>
+                </Select>
+              </Field>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Field label="تاريخ أول إصدار" required>
+                <Input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
+              </Field>
+              <Field label="طريقة الدفع" required>
+                <Select value={paymentMethod} onChange={e => setPaymentMethod(e.target.value)}>
+                  <option value="credit">آجل (على حساب العميل)</option>
+                  {treasuryAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </Select>
+              </Field>
+            </div>
+            {reps.length > 0 && (
+              <Field label="المندوب" hint="اختياري - لاحتساب العمولة تلقائيًا">
+                <Select value={repId} onChange={e => setRepId(e.target.value)}>
+                  <option value="">بدون مندوب</option>
+                  {reps.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                </Select>
+              </Field>
+            )}
+            <div>
+              <p className="text-sm font-body text-stone-600 mb-1">بنود الفاتورة (تتكرر كما هي في كل مرة)</p>
+              <ItemsEditor items={items} setItems={setItems} products={products} currency={settings.currency} priceLabel="سعر البيع" />
+            </div>
+            <InvoiceTotalsBox totals={totals} currency={settings.currency} discount={discount} setDiscount={setDiscount} applyTax={applyTax} setApplyTax={setApplyTax} settings={settings} />
+            <div className="flex justify-end gap-2 mt-1">
+              <Button variant="secondary" onClick={onClose}>إلغاء</Button>
+              <Button disabled={!canSave} icon={Check} onClick={() => onSave({
+                name, customerId, frequency, nextRunDate: startDate, paymentMethod, repId: repId || null,
+                discount: Number(discount) || 0, applyTax,
+                items: validItems.map(it => ({
+                  productId: it.productId || null,
+                  name: it.name || (products.find(p => p.id === it.productId)?.name) || 'بند',
+                  qty: Number(it.qty), price: Number(it.price) || 0, cost: Number(it.cost) || 0,
+                })),
+              })}>حفظ الفاتورة الدورية</Button>
+            </div>
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function RecurringInvoicesView({ templates, customers, products, reps, accounts, settings, onAdd, onToggle, onDelete }) {
+  const [showForm, setShowForm] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(null);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-body text-stone-500">تُصدر هذه الفواتير نفسها تلقائيًا في موعدها في كل مرة تفتح فيها النظام.</p>
+        <Button icon={Plus} onClick={() => setShowForm(true)}>فاتورة دورية جديدة</Button>
+      </div>
+
+      {templates.length === 0 ? (
+        <Card className="p-4">
+          <EmptyState icon={FileText} title="لا توجد فواتير دورية بعد" hint="أنشئ اشتراكًا متكررًا لعميل ثابت (شهري أو أسبوعي) ليصدر تلقائيًا." />
+        </Card>
+      ) : (
+        <Card className="overflow-x-auto p-4">
+          <table className="w-full text-sm font-body">
+            <thead>
+              <tr className="text-stone-400 text-xs border-b border-stone-100">
+                <th className="text-right py-2 font-normal">الاسم</th>
+                <th className="text-right py-2 font-normal">العميل</th>
+                <th className="text-right py-2 font-normal">التكرار</th>
+                <th className="text-right py-2 font-normal">الإصدار القادم</th>
+                <th className="text-right py-2 font-normal">الحالة</th>
+                <th className="text-right py-2 font-normal"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {templates.map(t => {
+                const cust = customers.find(c => c.id === t.customerId);
+                return (
+                  <tr key={t.id} className="border-b border-stone-50">
+                    <td className="py-2 text-stone-700">{t.name}</td>
+                    <td className="py-2 text-stone-600">{cust ? cust.name : '-'}</td>
+                    <td className="py-2">{t.frequency === 'monthly' ? 'شهري' : 'أسبوعي'}</td>
+                    <td className="py-2 text-stone-600">{fmtDate(t.nextRunDate)}</td>
+                    <td className="py-2">
+                      <button onClick={() => onToggle(t.id)}>
+                        <Badge tone={t.active ? 'green' : 'neutral'}>{t.active ? 'مفعّلة' : 'موقوفة'}</Badge>
+                      </button>
+                    </td>
+                    <td className="py-2"><IconButton icon={Trash2} variant="danger" title="حذف" onClick={() => setConfirmDel(t)} /></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {showForm && (
+        <RecurringFormModal
+          customers={customers} products={products} reps={reps} accounts={accounts} settings={settings}
+          onClose={() => setShowForm(false)}
+          onSave={(data) => { onAdd(data); setShowForm(false); }}
+        />
+      )}
+
+      {confirmDel && (
+        <ConfirmDialog
+          title="حذف فاتورة دورية"
+          message={`هل تريد إيقاف وحذف "${confirmDel.name}"؟ الفواتير الصادرة سابقًا منها تبقى محفوظة.`}
+          onCancel={() => setConfirmDel(null)}
+          onConfirm={() => { onDelete(confirmDel.id); setConfirmDel(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ============================== COLLECTIONS REMINDERS (WhatsApp) ============================== */
+
+function ReminderCard({ item, settings, onCopy }) {
+  const { invoice, customer, stage } = item;
+  const message = composeReminderMessage(stage, invoice, customer, settings.companyName, settings.currency);
+  const tone = stage.stage === 'overdue' ? 'red' : stage.stage === 'due_today' ? 'amber' : 'blue';
+  const label = stage.stage === 'overdue' ? `متأخرة ${stage.daysOverdue} يوم` : stage.stage === 'due_today' ? 'مستحقة اليوم' : `مستحقة خلال ${stage.daysToDue} يوم`;
+  const hasPhone = !!(customer && customer.phone);
+
+  return (
+    <Card className="p-4 flex flex-col gap-2.5">
+      <div className="flex items-center justify-between">
+        <p className="font-body font-medium text-stone-800">{customer ? customer.name : 'عميل نقدي'}</p>
+        <Badge tone={tone}>{label}</Badge>
+      </div>
+      <div className="flex items-center justify-between text-sm font-body text-stone-500">
+        <span>فاتورة #{invoice.no}</span>
+        <Figure value={invoice.total - invoice.paidAmount} currency={settings.currency} tone="neg" />
+      </div>
+      <p className="text-sm font-body text-stone-600 bg-stone-50 rounded-md p-2.5 leading-relaxed">{message}</p>
+      <div className="flex gap-2">
+        <Button size="sm" variant="outline" icon={Check} onClick={() => onCopy(message)}>نسخ الرسالة</Button>
+        {hasPhone ? (
+          <a href={buildWhatsAppLink(customer.phone, message)} target="_blank" rel="noreferrer" className="flex-1">
+            <Button size="sm" className="w-full">إرسال عبر واتساب</Button>
+          </a>
+        ) : (
+          <span className="text-xs text-stone-400 font-body self-center">لا يوجد رقم هاتف محفوظ لهذا العميل</span>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function RemindersView({ salesInvoices, customers, settings, showToast }) {
+  const today = todayISO();
+  const items = salesInvoices
+    .map(invoice => {
+      const stage = reminderStage(invoice, settings, today);
+      if (!stage) return null;
+      const customer = customers.find(c => c.id === invoice.customerId);
+      return { invoice, customer, stage };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      const order = { overdue: 0, due_today: 1, upcoming: 2 };
+      return order[a.stage.stage] - order[b.stage.stage];
+    });
+
+  const overdue = items.filter(i => i.stage.stage === 'overdue');
+  const dueToday = items.filter(i => i.stage.stage === 'due_today');
+  const upcoming = items.filter(i => i.stage.stage === 'upcoming');
+
+  function copy(text) {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => showToast('تم نسخ الرسالة'));
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <p className="text-sm font-body text-stone-500">
+        النظام يجهّز الرسالة المناسبة تلقائيًا حسب المرحلة، وتبقى لك خطوة أخيرة بضغطة واحدة لإرسالها عبر واتساب.
+      </p>
+
+      {items.length === 0 ? (
+        <Card className="p-4"><EmptyState icon={Users} title="لا توجد تذكيرات مستحقة الآن" hint="ستظهر هنا تلقائيًا فواتير العملاء القريبة من الاستحقاق أو المتأخرة." /></Card>
+      ) : (
+        <>
+          {overdue.length > 0 && (
+            <div className="flex flex-col gap-2">
+              <p className="font-display font-semibold text-rose-700 text-sm flex items-center gap-1.5"><AlertTriangle size={15} /> متأخرة السداد ({overdue.length})</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {overdue.map(item => <ReminderCard key={item.invoice.id} item={item} settings={settings} onCopy={copy} />)}
+              </div>
+            </div>
+          )}
+          {dueToday.length > 0 && (
+            <div className="flex flex-col gap-2">
+              <p className="font-display font-semibold text-amber-700 text-sm">مستحقة اليوم ({dueToday.length})</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {dueToday.map(item => <ReminderCard key={item.invoice.id} item={item} settings={settings} onCopy={copy} />)}
+              </div>
+            </div>
+          )}
+          {upcoming.length > 0 && (
+            <div className="flex flex-col gap-2">
+              <p className="font-display font-semibold text-sky-700 text-sm">تذكير مبكر ({upcoming.length})</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {upcoming.map(item => <ReminderCard key={item.invoice.id} item={item} settings={settings} onCopy={copy} />)}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ============================== DEMAND FORECAST ============================== */
+
+function ForecastView({ products, salesInvoices, currency }) {
+  const today = todayISO();
+  const forecast = computeForecast(products, salesInvoices, today, 90);
+  const urgent = forecast.filter(f => f.coverageWeeks < 2);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-sm font-body text-stone-500">
+        يحلل النظام معدل بيع كل منتج خلال آخر 3 أشهر ويقترح كمية إعادة الطلب لتغطية أسبوعين قادمين، لتجنب نفاد المخزون.
+      </p>
+
+      {urgent.length > 0 && (
+        <Card className="p-4 border-amber-300">
+          <p className="font-display font-semibold text-amber-700 text-sm mb-2 flex items-center gap-1.5"><AlertTriangle size={15} /> يُنصح بالطلب قريبًا</p>
+          <ul className="flex flex-col gap-1.5 font-body text-sm text-stone-700">
+            {urgent.map(f => (
+              <li key={f.product.id}>
+                بناءً على مبيعاتك خلال آخر 3 أشهر، يُنصح بطلب <strong>{f.suggestedOrder}</strong> {f.product.unit} من <strong>{f.product.name}</strong> خلال الأسبوع القادم لتجنب انقطاعه (المخزون الحالي يغطي تقريبًا {f.coverageWeeks.toFixed(1)} أسبوع فقط).
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {forecast.length === 0 ? (
+        <Card className="p-4"><EmptyState icon={Package} title="لا توجد بيانات مبيعات كافية بعد" hint="بعد تسجيل بعض فواتير المبيعات، ستظهر هنا توقعات الطلب لكل منتج." /></Card>
+      ) : (
+        <Card className="overflow-x-auto p-4">
+          <table className="w-full text-sm font-body">
+            <thead>
+              <tr className="text-stone-400 text-xs border-b border-stone-100">
+                <th className="text-right py-2 font-normal">المنتج</th>
+                <th className="text-right py-2 font-normal">مبيعات آخر 3 أشهر</th>
+                <th className="text-right py-2 font-normal">متوسط أسبوعي</th>
+                <th className="text-right py-2 font-normal">المخزون الحالي</th>
+                <th className="text-right py-2 font-normal">مدة التغطية</th>
+                <th className="text-right py-2 font-normal">كمية مقترح طلبها</th>
+              </tr>
+            </thead>
+            <tbody>
+              {forecast.map(f => (
+                <tr key={f.product.id} className="border-b border-stone-50">
+                  <td className="py-2 text-stone-700">{f.product.name}</td>
+                  <td className="py-2"><Figure value={f.totalSold} /></td>
+                  <td className="py-2"><Figure value={f.weeklyAvg} /></td>
+                  <td className="py-2">{f.product.qty} {f.product.unit}</td>
+                  <td className="py-2">
+                    <Badge tone={f.coverageWeeks < 2 ? 'red' : f.coverageWeeks < 4 ? 'amber' : 'green'}>
+                      {f.coverageWeeks === Infinity ? '-' : `${f.coverageWeeks.toFixed(1)} أسبوع`}
+                    </Badge>
+                  </td>
+                  <td className="py-2">{f.suggestedOrder > 0 ? <span className="font-medium text-emerald-700">{f.suggestedOrder} {f.product.unit}</span> : '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ============================== ACCOUNT STATEMENT VIEW ============================== */
+
+function StatementView({ customers, suppliers, salesInvoices, purchaseInvoices, payments, accounts, settings }) {
+  const [partyType, setPartyType] = useState('customer');
+  const [partyId, setPartyId] = useState('');
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState(todayISO());
+
+  const parties = partyType === 'customer' ? customers : suppliers;
+  const party = parties.find(p => p.id === partyId) || null;
+
+  const statement = partyId
+    ? computeStatement(partyType, partyId, from, to, salesInvoices, purchaseInvoices, payments, accounts)
+    : null;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <Card className="p-4 no-print">
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+          <Field label="نوع الطرف" required>
+            <Select value={partyType} onChange={e => { setPartyType(e.target.value); setPartyId(''); }}>
+              <option value="customer">عميل</option>
+              <option value="supplier">مورد</option>
+            </Select>
+          </Field>
+          <Field label={partyType === 'customer' ? 'العميل' : 'المورد'} required>
+            <Select value={partyId} onChange={e => setPartyId(e.target.value)}>
+              <option value="">اختر...</option>
+              {parties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </Select>
+          </Field>
+          <Field label="من تاريخ" hint="اتركه فارغًا لعرض كل السجل">
+            <Input type="date" value={from} onChange={e => setFrom(e.target.value)} />
+          </Field>
+          <Field label="إلى تاريخ">
+            <Input type="date" value={to} onChange={e => setTo(e.target.value)} />
+          </Field>
+        </div>
+        {party && (
+          <div className="flex justify-end gap-2 mt-3">
+            <Button variant="outline" icon={Download} onClick={() => exportRowsToExcel(`كشف-حساب-${party.name}`, 'كشف حساب', statement.rows.map(r => ({
+              'التاريخ': fmtDate(r.date), 'البيان': r.description, 'مدين': r.debit, 'دائن': r.credit, 'الرصيد': r.balance,
+            })))}>تصدير Excel</Button>
+            <Button icon={Printer} onClick={() => window.print()}>طباعة / تصدير PDF</Button>
+          </div>
+        )}
+      </Card>
+
+      {!party ? (
+        <Card className="p-4">
+          <EmptyState icon={FileText} title="اختر عميلاً أو موردًا" hint="سيظهر هنا كشف حساب كامل بالرصيد الافتتاحي وكل الحركات والرصيد الختامي." />
+        </Card>
+      ) : (
+        <Card className="p-5 print-area">
+          <div className="flex items-start justify-between mb-4 pb-4 border-b border-stone-200">
+            <div>
+              <p className="font-display font-bold text-lg text-stone-800">{settings.companyName}</p>
+              <p className="text-sm text-stone-500 font-body">كشف حساب {partyType === 'customer' ? 'عميل' : 'مورد'}</p>
+            </div>
+            <div className="text-left text-sm font-body text-stone-500">
+              <p>تاريخ الإصدار: {fmtDate(todayISO())}</p>
+              {(from || to) && <p>الفترة: {from ? fmtDate(from) : 'البداية'} - {to ? fmtDate(to) : 'اليوم'}</p>}
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <p className="font-body font-semibold text-stone-800">{party.name}</p>
+              {party.phone && <p className="text-xs text-stone-400 font-body" dir="ltr">{party.phone}</p>}
+            </div>
+            <div className="text-left">
+              <p className="text-xs text-stone-400 font-body">الرصيد الافتتاحي</p>
+              <Figure value={statement.openingBalance} currency={settings.currency} />
+            </div>
+          </div>
+
+          {statement.rows.length === 0 ? (
+            <p className="text-sm text-stone-400 font-body py-6 text-center">لا توجد حركات في هذه الفترة.</p>
+          ) : (
+            <table className="w-full text-sm font-body">
+              <thead>
+                <tr className="text-stone-400 text-xs border-b border-stone-200">
+                  <th className="text-right py-2 font-normal">التاريخ</th>
+                  <th className="text-right py-2 font-normal">البيان</th>
+                  <th className="text-right py-2 font-normal">مدين</th>
+                  <th className="text-right py-2 font-normal">دائن</th>
+                  <th className="text-right py-2 font-normal">الرصيد</th>
+                </tr>
+              </thead>
+              <tbody>
+                {statement.rows.map((r, i) => (
+                  <tr key={i} className="border-b border-stone-50">
+                    <td className="py-2 text-stone-500">{fmtDate(r.date)}</td>
+                    <td className="py-2 text-stone-700">{r.description}</td>
+                    <td className="py-2">{r.debit > 0 ? <Figure value={r.debit} /> : '-'}</td>
+                    <td className="py-2">{r.credit > 0 ? <Figure value={r.credit} /> : '-'}</td>
+                    <td className="py-2"><Figure value={r.balance} currency={settings.currency} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <div className="flex justify-end mt-4 pt-4 border-t-2 border-stone-200">
+            <div className="text-left">
+              <p className="text-xs text-stone-400 font-body">
+                {partyType === 'customer' ? 'الرصيد الختامي المستحق من العميل' : 'الرصيد الختامي المستحق للمورد'}
+              </p>
+              <Figure value={statement.closingBalance} currency={settings.currency} className="text-lg font-semibold" />
+            </div>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 /* ============================== REPORTS ============================== */
+
+function ReportExportBar({ onExportExcel, onPrint }) {
+  return (
+    <div className="flex justify-end gap-2 mb-3 no-print">
+      <Button size="sm" variant="outline" icon={Download} onClick={onExportExcel}>تصدير Excel</Button>
+      <Button size="sm" variant="outline" icon={Printer} onClick={onPrint}>طباعة / PDF</Button>
+    </div>
+  );
+}
 
 function TrialBalanceReport({ accounts, journalEntries, currency, from, to }) {
   const entries = filterEntriesByDate(journalEntries, from, to);
@@ -1717,47 +3196,54 @@ function TrialBalanceReport({ accounts, journalEntries, currency, from, to }) {
   const totalCredit = rows.reduce((s, r) => s + r.credit, 0);
   const balanced = Math.abs(totalDebit - totalCredit) < 0.005;
 
+  const exportExcel = () => exportRowsToExcel('ميزان-المراجعة', 'ميزان المراجعة', rows.map(r => ({
+    'الرمز': r.acc.code, 'الحساب': r.acc.name, 'مدين': r.debit, 'دائن': r.credit,
+  })));
+
   return (
-    <Card className="p-4 overflow-x-auto">
-      <table className="w-full text-sm font-body">
-        <thead>
-          <tr className="text-stone-400 text-xs border-b border-stone-100">
-            <th className="text-right py-2 font-normal">الرمز</th>
-            <th className="text-right py-2 font-normal">الحساب</th>
-            <th className="text-right py-2 font-normal">مدين</th>
-            <th className="text-right py-2 font-normal">دائن</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(r => (
-            <tr key={r.acc.id} className="border-b border-stone-50">
-              <td className="py-2 text-stone-500">{r.acc.code}</td>
-              <td className="py-2 text-stone-700">{r.acc.name}</td>
-              <td className="py-2"><Figure value={r.debit} currency={currency} /></td>
-              <td className="py-2"><Figure value={r.credit} currency={currency} /></td>
+    <>
+      <ReportExportBar onExportExcel={exportExcel} onPrint={() => window.print()} />
+      <Card className="p-4 overflow-x-auto print-area">
+        <table className="w-full text-sm font-body">
+          <thead>
+            <tr className="text-stone-400 text-xs border-b border-stone-100">
+              <th className="text-right py-2 font-normal">الرمز</th>
+              <th className="text-right py-2 font-normal">الحساب</th>
+              <th className="text-right py-2 font-normal">مدين</th>
+              <th className="text-right py-2 font-normal">دائن</th>
             </tr>
-          ))}
-          {rows.length === 0 && (
-            <tr><td colSpan={4} className="py-6 text-center text-stone-400 text-xs">لا توجد حركات في هذه الفترة</td></tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.acc.id} className="border-b border-stone-50">
+                <td className="py-2 text-stone-500">{r.acc.code}</td>
+                <td className="py-2 text-stone-700">{r.acc.name}</td>
+                <td className="py-2"><Figure value={r.debit} currency={currency} /></td>
+                <td className="py-2"><Figure value={r.credit} currency={currency} /></td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr><td colSpan={4} className="py-6 text-center text-stone-400 text-xs">لا توجد حركات في هذه الفترة</td></tr>
+            )}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot>
+              <tr className="border-t-2 border-stone-200 font-semibold">
+                <td className="py-2" colSpan={2}>الإجمالي</td>
+                <td className="py-2"><Figure value={totalDebit} currency={currency} /></td>
+                <td className="py-2"><Figure value={totalCredit} currency={currency} /></td>
+              </tr>
+            </tfoot>
           )}
-        </tbody>
+        </table>
         {rows.length > 0 && (
-          <tfoot>
-            <tr className="border-t-2 border-stone-200 font-semibold">
-              <td className="py-2" colSpan={2}>الإجمالي</td>
-              <td className="py-2"><Figure value={totalDebit} currency={currency} /></td>
-              <td className="py-2"><Figure value={totalCredit} currency={currency} /></td>
-            </tr>
-          </tfoot>
+          <div className={classNames('mt-3 flex items-center gap-1.5 text-xs font-body px-3 py-1.5 rounded-md w-fit', balanced ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-600')}>
+            {balanced ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}
+            {balanced ? 'ميزان المراجعة متوازن' : 'ميزان المراجعة غير متوازن - تحقق من القيود'}
+          </div>
         )}
-      </table>
-      {rows.length > 0 && (
-        <div className={classNames('mt-3 flex items-center gap-1.5 text-xs font-body px-3 py-1.5 rounded-md w-fit', balanced ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-600')}>
-          {balanced ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}
-          {balanced ? 'ميزان المراجعة متوازن' : 'ميزان المراجعة غير متوازن - تحقق من القيود'}
-        </div>
-      )}
-    </Card>
+      </Card>
+    </>
   );
 }
 
@@ -1769,41 +3255,52 @@ function IncomeStatementReport({ accounts, journalEntries, currency, from, to })
   const totalExp = expenses.reduce((s, r) => s + r.bal, 0);
   const net = totalRev - totalExp;
 
+  const exportExcel = () => exportRowsToExcel('قائمة-الدخل', 'قائمة الدخل', [
+    ...revenues.map(r => ({ 'البند': r.acc.name, 'التصنيف': 'إيراد', 'المبلغ': r.bal })),
+    { 'البند': 'إجمالي الإيرادات', 'التصنيف': '', 'المبلغ': totalRev },
+    ...expenses.map(r => ({ 'البند': r.acc.name, 'التصنيف': 'مصروف', 'المبلغ': r.bal })),
+    { 'البند': 'إجمالي المصاريف', 'التصنيف': '', 'المبلغ': totalExp },
+    { 'البند': net >= 0 ? 'صافي الربح' : 'صافي الخسارة', 'التصنيف': '', 'المبلغ': net },
+  ]);
+
   return (
-    <Card className="p-4">
-      <p className="font-display font-semibold text-stone-700 mb-3 text-sm">الإيرادات</p>
-      <table className="w-full text-sm font-body mb-4">
-        <tbody>
-          {revenues.map(r => (
-            <tr key={r.acc.id} className="border-b border-stone-50">
-              <td className="py-1.5 text-stone-600">{r.acc.name}</td>
-              <td className="py-1.5 text-left"><Figure value={r.bal} currency={currency} /></td>
-            </tr>
-          ))}
-          {revenues.length === 0 && <tr><td className="py-2 text-stone-400 text-xs">لا توجد إيرادات في هذه الفترة</td></tr>}
-        </tbody>
-        <tfoot><tr className="font-semibold border-t border-stone-200"><td className="py-1.5">إجمالي الإيرادات</td><td className="py-1.5 text-left"><Figure value={totalRev} currency={currency} tone="pos" /></td></tr></tfoot>
-      </table>
+    <>
+      <ReportExportBar onExportExcel={exportExcel} onPrint={() => window.print()} />
+      <Card className="p-4 print-area">
+        <p className="font-display font-semibold text-stone-700 mb-3 text-sm">الإيرادات</p>
+        <table className="w-full text-sm font-body mb-4">
+          <tbody>
+            {revenues.map(r => (
+              <tr key={r.acc.id} className="border-b border-stone-50">
+                <td className="py-1.5 text-stone-600">{r.acc.name}</td>
+                <td className="py-1.5 text-left"><Figure value={r.bal} currency={currency} /></td>
+              </tr>
+            ))}
+            {revenues.length === 0 && <tr><td className="py-2 text-stone-400 text-xs">لا توجد إيرادات في هذه الفترة</td></tr>}
+          </tbody>
+          <tfoot><tr className="font-semibold border-t border-stone-200"><td className="py-1.5">إجمالي الإيرادات</td><td className="py-1.5 text-left"><Figure value={totalRev} currency={currency} tone="pos" /></td></tr></tfoot>
+        </table>
 
-      <p className="font-display font-semibold text-stone-700 mb-3 text-sm">المصاريف</p>
-      <table className="w-full text-sm font-body mb-4">
-        <tbody>
-          {expenses.map(r => (
-            <tr key={r.acc.id} className="border-b border-stone-50">
-              <td className="py-1.5 text-stone-600">{r.acc.name}</td>
-              <td className="py-1.5 text-left"><Figure value={r.bal} currency={currency} /></td>
-            </tr>
-          ))}
-          {expenses.length === 0 && <tr><td className="py-2 text-stone-400 text-xs">لا توجد مصاريف في هذه الفترة</td></tr>}
-        </tbody>
-        <tfoot><tr className="font-semibold border-t border-stone-200"><td className="py-1.5">إجمالي المصاريف</td><td className="py-1.5 text-left"><Figure value={totalExp} currency={currency} tone="neg" /></td></tr></tfoot>
-      </table>
+        <p className="font-display font-semibold text-stone-700 mb-3 text-sm">المصاريف</p>
+        <table className="w-full text-sm font-body mb-4">
+          <tbody>
+            {expenses.map(r => (
+              <tr key={r.acc.id} className="border-b border-stone-50">
+                <td className="py-1.5 text-stone-600">{r.acc.name}</td>
+                <td className="py-1.5 text-left"><Figure value={r.bal} currency={currency} /></td>
+              </tr>
+            ))}
+            {expenses.length === 0 && <tr><td className="py-2 text-stone-400 text-xs">لا توجد مصاريف في هذه الفترة</td></tr>}
+          </tbody>
+          <tfoot><tr className="font-semibold border-t border-stone-200"><td className="py-1.5">إجمالي المصاريف</td><td className="py-1.5 text-left"><Figure value={totalExp} currency={currency} tone="neg" /></td></tr></tfoot>
+        </table>
 
-      <div className={classNames('flex items-center justify-between text-base font-body font-semibold px-3 py-2.5 rounded-md', net >= 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-600')}>
-        <span>{net >= 0 ? 'صافي الربح' : 'صافي الخسارة'}</span>
-        <Figure value={Math.abs(net)} currency={currency} />
-      </div>
-    </Card>
+        <div className={classNames('flex items-center justify-between text-base font-body font-semibold px-3 py-2.5 rounded-md', net >= 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-600')}>
+          <span>{net >= 0 ? 'صافي الربح' : 'صافي الخسارة'}</span>
+          <Figure value={Math.abs(net)} currency={currency} />
+        </div>
+      </Card>
+    </>
   );
 }
 
@@ -1849,20 +3346,110 @@ function BalanceSheetReport({ accounts, journalEntries, currency, to }) {
     </div>
   );
 
+  const exportExcel = () => exportRowsToExcel('الميزانية-العمومية', 'الميزانية العمومية', [
+    ...assets.map(r => ({ 'البند': r.acc.name, 'القسم': 'أصول', 'المبلغ': r.bal })),
+    { 'البند': 'إجمالي الأصول', 'القسم': '', 'المبلغ': totalAssets },
+    ...liabilities.map(r => ({ 'البند': r.acc.name, 'القسم': 'خصوم', 'المبلغ': r.bal })),
+    { 'البند': 'إجمالي الخصوم', 'القسم': '', 'المبلغ': totalLiabilities },
+    ...equity.map(r => ({ 'البند': r.acc.name, 'القسم': 'حقوق ملكية', 'المبلغ': r.bal })),
+    { 'البند': 'أرباح الفترة الحالية', 'القسم': 'حقوق ملكية', 'المبلغ': currentProfit },
+    { 'البند': 'إجمالي حقوق الملكية', 'القسم': '', 'المبلغ': totalEquity },
+  ]);
+
   return (
-    <Card className="p-4">
-      <Section title="الأصول" rows={assets} total={totalAssets} />
-      <Section title="الخصوم" rows={liabilities} total={totalLiabilities} />
-      <Section title="حقوق الملكية" rows={equity} extra={{ label: 'أرباح الفترة الحالية (غير مرحّلة)', value: currentProfit }} total={totalEquity} />
-      <div className={classNames('flex items-center justify-between text-sm font-body px-3 py-2 rounded-md', balanced ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-600')}>
-        <span>الأصول: {fmtNum(totalAssets)} {currency} | الخصوم + حقوق الملكية: {fmtNum(totalLiabilities + totalEquity)} {currency}</span>
-        {balanced ? <span className="flex items-center gap-1"><CheckCircle2 size={14} /> متوازنة</span> : <span className="flex items-center gap-1"><AlertTriangle size={14} /> غير متوازنة</span>}
-      </div>
-    </Card>
+    <>
+      <ReportExportBar onExportExcel={exportExcel} onPrint={() => window.print()} />
+      <Card className="p-4 print-area">
+        <Section title="الأصول" rows={assets} total={totalAssets} />
+        <Section title="الخصوم" rows={liabilities} total={totalLiabilities} />
+        <Section title="حقوق الملكية" rows={equity} extra={{ label: 'أرباح الفترة الحالية (غير مرحّلة)', value: currentProfit }} total={totalEquity} />
+        <div className={classNames('flex items-center justify-between text-sm font-body px-3 py-2 rounded-md', balanced ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-600')}>
+          <span>الأصول: {fmtNum(totalAssets)} {currency} | الخصوم + حقوق الملكية: {fmtNum(totalLiabilities + totalEquity)} {currency}</span>
+          {balanced ? <span className="flex items-center gap-1"><CheckCircle2 size={14} /> متوازنة</span> : <span className="flex items-center gap-1"><AlertTriangle size={14} /> غير متوازنة</span>}
+        </div>
+      </Card>
+    </>
   );
 }
 
-function ReportsView({ accounts, journalEntries, currency }) {
+function ItemCardReport({ products, salesInvoices, purchaseInvoices, from, to }) {
+  const [productId, setProductId] = useState(products[0]?.id || '');
+  const product = products.find(p => p.id === productId) || null;
+  const card = product ? computeItemCard(product, salesInvoices, purchaseInvoices, from, to) : null;
+
+  const exportExcel = () => {
+    if (!product || !card) return;
+    exportRowsToExcel(`بطاقة-صنف-${product.name}`, 'بطاقة صنف', card.rows.map(r => ({
+      'التاريخ': fmtDate(r.date), 'البيان': r.description, 'وارد': r.qtyIn, 'صادر': r.qtyOut, 'الرصيد': r.balance,
+    })));
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between no-print">
+        <div className="w-64">
+          <Select value={productId} onChange={e => setProductId(e.target.value)}>
+            {products.length === 0 && <option value="">لا توجد منتجات</option>}
+            {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </Select>
+        </div>
+        {product && <ReportExportBar onExportExcel={exportExcel} onPrint={() => window.print()} />}
+      </div>
+
+      {!product ? (
+        <Card className="p-4"><EmptyState icon={Package} title="لا توجد منتجات بعد" hint="أضف منتجات أولاً من قسم المنتجات والمخزون." /></Card>
+      ) : (
+        <Card className="p-4 print-area">
+          <div className="flex items-center justify-between mb-3 pb-3 border-b border-stone-200">
+            <div>
+              <p className="font-body font-semibold text-stone-800">{product.name}</p>
+              <p className="text-xs text-stone-400 font-body">{product.sku ? `رمز: ${product.sku}` : ''} {product.unit}</p>
+            </div>
+            <div className="text-left">
+              <p className="text-xs text-stone-400 font-body">الرصيد الافتتاحي (كمية)</p>
+              <span className="font-body font-medium">{card.openingQty} {product.unit}</span>
+            </div>
+          </div>
+
+          {card.rows.length === 0 ? (
+            <p className="text-sm text-stone-400 font-body py-6 text-center">لا توجد حركات لهذا الصنف في هذه الفترة.</p>
+          ) : (
+            <table className="w-full text-sm font-body">
+              <thead>
+                <tr className="text-stone-400 text-xs border-b border-stone-100">
+                  <th className="text-right py-2 font-normal">التاريخ</th>
+                  <th className="text-right py-2 font-normal">البيان</th>
+                  <th className="text-right py-2 font-normal">وارد</th>
+                  <th className="text-right py-2 font-normal">صادر</th>
+                  <th className="text-right py-2 font-normal">الرصيد</th>
+                </tr>
+              </thead>
+              <tbody>
+                {card.rows.map((r, i) => (
+                  <tr key={i} className="border-b border-stone-50">
+                    <td className="py-2 text-stone-500">{fmtDate(r.date)}</td>
+                    <td className="py-2 text-stone-700">{r.description}</td>
+                    <td className="py-2">{r.qtyIn > 0 ? <span className="text-emerald-700">{r.qtyIn}</span> : '-'}</td>
+                    <td className="py-2">{r.qtyOut > 0 ? <span className="text-rose-600">{r.qtyOut}</span> : '-'}</td>
+                    <td className="py-2 font-medium">{r.balance} {product.unit}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <div className="grid grid-cols-3 gap-3 mt-4 pt-3 border-t-2 border-stone-200 text-sm font-body">
+            <div><p className="text-xs text-stone-400">إجمالي الوارد</p><p className="font-medium text-emerald-700">{card.totalIn} {product.unit}</p></div>
+            <div><p className="text-xs text-stone-400">إجمالي الصادر</p><p className="font-medium text-rose-600">{card.totalOut} {product.unit}</p></div>
+            <div><p className="text-xs text-stone-400">الرصيد الختامي</p><p className="font-semibold">{card.closingQty} {product.unit}</p></div>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function ReportsView({ accounts, journalEntries, products, salesInvoices, purchaseInvoices, currency }) {
   const [tab, setTab] = useState('trial');
   const [from, setFrom] = useState('');
   const [to, setTo] = useState(todayISO());
@@ -1871,6 +3458,7 @@ function ReportsView({ accounts, journalEntries, currency }) {
     { key: 'trial', label: 'ميزان المراجعة' },
     { key: 'income', label: 'قائمة الدخل' },
     { key: 'balance', label: 'الميزانية العمومية' },
+    { key: 'itemCard', label: 'بطاقة صنف' },
   ];
 
   return (
@@ -1894,6 +3482,7 @@ function ReportsView({ accounts, journalEntries, currency }) {
       {tab === 'trial' && <TrialBalanceReport accounts={accounts} journalEntries={journalEntries} currency={currency} from={from} to={to} />}
       {tab === 'income' && <IncomeStatementReport accounts={accounts} journalEntries={journalEntries} currency={currency} from={from} to={to} />}
       {tab === 'balance' && <BalanceSheetReport accounts={accounts} journalEntries={journalEntries} currency={currency} to={to} />}
+      {tab === 'itemCard' && <ItemCardReport products={products} salesInvoices={salesInvoices} purchaseInvoices={purchaseInvoices} from={from} to={to} />}
     </div>
   );
 }
@@ -1904,21 +3493,90 @@ function SettingsView({ settings, onSave, onResetAll }) {
   const [form, setForm] = useState(settings);
   const [confirmReset, setConfirmReset] = useState(false);
   const dirty = JSON.stringify(form) !== JSON.stringify(settings);
+  const knownCurrency = CURRENCIES.some(c => c.symbol === form.currency);
+  const [customCurrency, setCustomCurrency] = useState(!knownCurrency);
 
   return (
     <div className="flex flex-col gap-4 max-w-lg">
       <Card className="p-4 flex flex-col gap-3">
+        <p className="font-display font-semibold text-stone-700 text-sm">بيانات عامة</p>
         <Field label="اسم المنشأة" required>
           <Input value={form.companyName} onChange={e => setForm(f => ({ ...f, companyName: e.target.value }))} />
         </Field>
-        <Field label="رمز العملة" required>
-          <Input value={form.currency} onChange={e => setForm(f => ({ ...f, currency: e.target.value }))} />
+        <Field label="العملة" required>
+          <Select
+            value={customCurrency ? '__custom__' : form.currency}
+            onChange={e => {
+              if (e.target.value === '__custom__') { setCustomCurrency(true); }
+              else { setCustomCurrency(false); setForm(f => ({ ...f, currency: e.target.value })); }
+            }}
+          >
+            {CURRENCIES.map(c => <option key={c.symbol} value={c.symbol}>{c.label} ({c.symbol})</option>)}
+            <option value="__custom__">أخرى (تحديد يدوي)</option>
+          </Select>
+          {customCurrency && (
+            <Input className="mt-2" value={form.currency} onChange={e => setForm(f => ({ ...f, currency: e.target.value }))} placeholder="رمز العملة" />
+          )}
         </Field>
-        <Field label="نسبة ضريبة القيمة المضافة الافتراضية (%)" required>
-          <Input type="number" min="0" step="0.1" dir="ltr" value={form.taxRate} onChange={e => setForm(f => ({ ...f, taxRate: Number(e.target.value) }))} />
+        <Field label="نوع الضريبة" required>
+          <Select value={form.taxType} onChange={e => setForm(f => ({ ...f, taxType: e.target.value }))}>
+            <option value="percent">نسبة مئوية (%)</option>
+            <option value="fixed">مبلغ ثابت لكل فاتورة</option>
+          </Select>
         </Field>
-        <Button disabled={!dirty} icon={Check} onClick={() => onSave(form)} className="self-start">حفظ الإعدادات</Button>
+        {form.taxType === 'percent' ? (
+          <Field label="نسبة الضريبة الافتراضية (%)" required>
+            <Input type="number" min="0" step="0.1" dir="ltr" value={form.taxRate} onChange={e => setForm(f => ({ ...f, taxRate: Number(e.target.value) }))} />
+          </Field>
+        ) : (
+          <Field label={`المبلغ الثابت للضريبة (${form.currency})`} required>
+            <Input type="number" min="0" step="0.01" dir="ltr" value={form.taxFixedAmount} onChange={e => setForm(f => ({ ...f, taxFixedAmount: Number(e.target.value) }))} />
+          </Field>
+        )}
       </Card>
+
+      <Card className="p-4 flex flex-col gap-3">
+        <label className="flex items-center justify-between">
+          <p className="font-display font-semibold text-stone-700 text-sm">برنامج عملاء VIP التلقائي</p>
+          <input type="checkbox" checked={form.vipEnabled} onChange={e => setForm(f => ({ ...f, vipEnabled: e.target.checked }))} />
+        </label>
+        <p className="text-xs text-stone-400 font-body -mt-2">عندما تتجاوز مشتريات العميل خلال آخر 30 يومًا هذا المبلغ، يُصنَّف VIP تلقائيًا ويُفعَّل له خصم في فواتيره القادمة دون تدخل بشري.</p>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label={`الحد الشهري (${form.currency})`}>
+            <Input type="number" min="0" step="1000" dir="ltr" value={form.vipMonthlyThreshold} onChange={e => setForm(f => ({ ...f, vipMonthlyThreshold: Number(e.target.value) }))} />
+          </Field>
+          <Field label="نسبة الخصم التلقائي (%)">
+            <Input type="number" min="0" step="0.1" dir="ltr" value={form.vipDiscountPercent} onChange={e => setForm(f => ({ ...f, vipDiscountPercent: Number(e.target.value) }))} />
+          </Field>
+        </div>
+      </Card>
+
+      <Card className="p-4 flex flex-col gap-3">
+        <p className="font-display font-semibold text-stone-700 text-sm">الآجل والتحصيل والجدارة الائتمانية</p>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="مهلة السداد الافتراضية (أيام)" hint="تُستخدم لحساب تاريخ استحقاق كل فاتورة آجلة">
+            <Input type="number" min="1" step="1" dir="ltr" value={form.defaultPaymentTermsDays} onChange={e => setForm(f => ({ ...f, defaultPaymentTermsDays: Number(e.target.value) }))} />
+          </Field>
+          <Field label="التذكير المبكر قبل الاستحقاق بـ (أيام)">
+            <Input type="number" min="1" step="1" dir="ltr" value={form.reminderBeforeDays} onChange={e => setForm(f => ({ ...f, reminderBeforeDays: Number(e.target.value) }))} />
+          </Field>
+          <Field label="عدد الفواتير المتأخرة لحظر الآجل" hint="إذا وصل عدد فواتير العميل المتأخرة لهذا الرقم يُمنع البيع له آجلاً">
+            <Input type="number" min="1" step="1" dir="ltr" value={form.overdueBlockCount} onChange={e => setForm(f => ({ ...f, overdueBlockCount: Number(e.target.value) }))} />
+          </Field>
+          <Field label="أيام التأخر لحظر الآجل" hint="أو إذا تجاوز تأخر أي فاتورة هذا العدد من الأيام">
+            <Input type="number" min="1" step="1" dir="ltr" value={form.overdueBlockThresholdDays} onChange={e => setForm(f => ({ ...f, overdueBlockThresholdDays: Number(e.target.value) }))} />
+          </Field>
+        </div>
+      </Card>
+
+      <Card className="p-4 flex flex-col gap-3">
+        <p className="font-display font-semibold text-stone-700 text-sm">المندوبون والعمولات</p>
+        <Field label="نسبة العمولة الافتراضية للمندوب الجديد (%)">
+          <Input type="number" min="0" step="0.1" dir="ltr" value={form.defaultCommissionPercent} onChange={e => setForm(f => ({ ...f, defaultCommissionPercent: Number(e.target.value) }))} />
+        </Field>
+      </Card>
+
+      <Button disabled={!dirty} icon={Check} onClick={() => onSave(form)} className="self-start">حفظ الإعدادات</Button>
 
       <Card className="p-4 flex flex-col gap-2 border-rose-200">
         <p className="font-display font-semibold text-rose-700 text-sm">منطقة الخطر</p>
@@ -1941,8 +3599,10 @@ function SettingsView({ settings, onSave, onResetAll }) {
 /* ============================== MAIN APP ============================== */
 
 const VIEW_TITLES = {
-  dashboard: 'لوحة التحكم', accounts: 'دليل الحسابات', customers: 'العملاء', suppliers: 'الموردون',
+  dashboard: 'لوحة التحكم', treasury: 'الصندوق والبنوك', accounts: 'دليل الحسابات', customers: 'العملاء', suppliers: 'الموردون',
+  workers: 'العمال والموظفون', statement: 'كشف حساب',
   products: 'المنتجات والمخزون', sales: 'فواتير المبيعات', purchases: 'فواتير المشتريات',
+  recurring: 'الفواتير الدورية', reminders: 'تذكيرات التحصيل', forecast: 'التنبؤ بالطلب', reps: 'المندوبون والعمولات',
   expenses: 'المصاريف', journal: 'القيود اليومية', reports: 'التقارير المالية', settings: 'الإعدادات',
 };
 
@@ -1961,10 +3621,14 @@ export default function AccountingApp() {
   const [purchaseInvoices, setPurchaseInvoices] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [journalEntries, setJournalEntries] = useState([]);
+  const [reps, setReps] = useState([]);
+  const [recurringTemplates, setRecurringTemplates] = useState([]);
+  const [payments, setPayments] = useState([]);
+  const [workers, setWorkers] = useState([]);
 
   useEffect(() => {
     (async () => {
-      const [s, acc, cust, sup, prod, sales, purch, exp, jour] = await Promise.all([
+      const [s, acc, cust, sup, prod, sales, purch, exp, jour, repsData, recurData, paymentsData, workersData] = await Promise.all([
         loadKey(STORAGE_KEYS.settings, null),
         loadKey(STORAGE_KEYS.accounts, null),
         loadKey(STORAGE_KEYS.customers, []),
@@ -1974,21 +3638,52 @@ export default function AccountingApp() {
         loadKey(STORAGE_KEYS.purchases, []),
         loadKey(STORAGE_KEYS.expenses, []),
         loadKey(STORAGE_KEYS.journal, []),
+        loadKey(STORAGE_KEYS.reps, []),
+        loadKey(STORAGE_KEYS.recurring, []),
+        loadKey(STORAGE_KEYS.payments, []),
+        loadKey(STORAGE_KEYS.workers, []),
       ]);
-      const finalSettings = s || DEFAULT_SETTINGS;
+      // Merge with defaults so upgrading from an older saved version still has the new fields.
+      const finalSettings = { ...DEFAULT_SETTINGS, ...(s || {}) };
       const finalAccounts = acc || DEFAULT_ACCOUNTS.map(a => ({ ...a }));
-      setSettings(finalSettings);
+      const finalReps = repsData || [];
+      const finalRecurring = recurData || [];
+      const finalSalesRaw = sales || [];
+      const finalProductsRaw = prod || [];
+
+      const today = todayISO();
+      const result = runRecurringInvoices({
+        recurringTemplates: finalRecurring, salesInvoices: finalSalesRaw, products: finalProductsRaw,
+        accounts: finalAccounts, journalEntries: jour || [], settings: finalSettings, reps: finalReps, today,
+      });
+
+      setSettings(result.settings);
       setAccounts(finalAccounts);
       setCustomers(cust || []);
       setSuppliers(sup || []);
-      setProducts(prod || []);
-      setSalesInvoices(sales || []);
+      setProducts(result.products);
+      setSalesInvoices(result.salesInvoices);
       setPurchaseInvoices(purch || []);
       setExpenses(exp || []);
-      setJournalEntries(jour || []);
-      if (!s) saveKey(STORAGE_KEYS.settings, finalSettings);
+      setJournalEntries(result.journalEntries);
+      setReps(finalReps);
+      setRecurringTemplates(result.recurringTemplates);
+      setPayments(paymentsData || []);
+      setWorkers(workersData || []);
+
+      if (!s) saveKey(STORAGE_KEYS.settings, result.settings);
       if (!acc) saveKey(STORAGE_KEYS.accounts, finalAccounts);
+      if (result.generatedCount > 0) {
+        saveKey(STORAGE_KEYS.settings, result.settings);
+        saveKey(STORAGE_KEYS.sales, result.salesInvoices);
+        saveKey(STORAGE_KEYS.products, result.products);
+        saveKey(STORAGE_KEYS.journal, result.journalEntries);
+        saveKey(STORAGE_KEYS.recurring, result.recurringTemplates);
+      }
       setLoading(false);
+      if (result.generatedCount > 0) {
+        setTimeout(() => showToast(`تم إصدار ${result.generatedCount} فاتورة دورية مستحقة تلقائيًا`), 300);
+      }
     })();
   }, []);
 
@@ -2013,6 +3708,57 @@ export default function AccountingApp() {
     const next = accounts.filter(a => a.id !== id);
     setAccounts(next); persist(STORAGE_KEYS.accounts, next);
     showToast('تم حذف الحساب');
+  }
+
+  /* ---------- Treasury (cash/bank/wallet) accounts ---------- */
+  function addTreasuryAccount(form) {
+    const existingTreasuryCount = getTreasuryAccounts(accounts).length;
+    const acc = {
+      id: uid('acc'), code: String(1000 + existingTreasuryCount * 10), name: form.name.trim(),
+      type: 'asset', kind: form.kind, system: false,
+    };
+    let nextAccounts = [...accounts, acc];
+    let nextJournal = journalEntries;
+    let nextSettings = settings;
+
+    if (form.openingBalance > 0) {
+      const jeNo = settings.nextJournalNo;
+      const je = makeEntry(jeNo, todayISO(), `رصيد افتتاحي - ${acc.name}`, [
+        { accountId: acc.id, debit: form.openingBalance, credit: 0 },
+        { accountId: getAccountByKind(accounts, 'capital').id, debit: 0, credit: form.openingBalance },
+      ], 'manual', null);
+      nextJournal = [...journalEntries, je];
+      nextSettings = { ...settings, nextJournalNo: jeNo + 1 };
+      setJournalEntries(nextJournal); setSettings(nextSettings);
+      persist(STORAGE_KEYS.journal, nextJournal);
+      persist(STORAGE_KEYS.settings, nextSettings);
+    }
+    setAccounts(nextAccounts); persist(STORAGE_KEYS.accounts, nextAccounts);
+    showToast('تمت إضافة الحساب بنجاح');
+  }
+  function deleteTreasuryAccount(id) {
+    const next = accounts.filter(a => a.id !== id);
+    setAccounts(next); persist(STORAGE_KEYS.accounts, next);
+    showToast('تم حذف الحساب');
+  }
+  function addTreasuryTransaction(data) {
+    const jeNo = settings.nextJournalNo;
+    const lines = data.type === 'deposit'
+      ? [
+          { accountId: data.treasuryAccountId, debit: data.amount, credit: 0 },
+          { accountId: data.offsetAccountId, debit: 0, credit: data.amount },
+        ]
+      : [
+          { accountId: data.offsetAccountId, debit: data.amount, credit: 0 },
+          { accountId: data.treasuryAccountId, debit: 0, credit: data.amount },
+        ];
+    const je = makeEntry(jeNo, data.date, data.description || (data.type === 'deposit' ? 'إيداع' : 'سحب'), lines, 'manual', null);
+    const nextJournal = [...journalEntries, je];
+    const nextSettings = { ...settings, nextJournalNo: jeNo + 1 };
+    setJournalEntries(nextJournal); setSettings(nextSettings);
+    persist(STORAGE_KEYS.journal, nextJournal);
+    persist(STORAGE_KEYS.settings, nextSettings);
+    showToast('تم تسجيل الحركة بنجاح');
   }
 
   /* ---------- Customers / Suppliers ---------- */
@@ -2059,7 +3805,7 @@ export default function AccountingApp() {
 
   /* ---------- Sales Invoice ---------- */
   function addSalesInvoice(data) {
-    const totals = computeInvoiceTotals(data.items, data.discount, data.applyTax, settings.taxRate);
+    const totals = computeInvoiceTotals(data.items, data.discount, data.applyTax, settings);
     const no = settings.nextSalesNo;
     const invId = uid('sinv');
     const jeNo = settings.nextJournalNo;
@@ -2068,7 +3814,7 @@ export default function AccountingApp() {
     if (data.paymentMethod === 'credit') {
       lines.push({ accountId: getAccountByKind(accounts, 'ar').id, debit: totals.total, credit: 0 });
     } else {
-      const cashAcc = getCashLikeAccountId(accounts, data.paymentMethod);
+      const cashAcc = resolveTreasuryAccountId(data.paymentMethod, accounts);
       lines.push({ accountId: cashAcc, debit: totals.total, credit: 0 });
     }
     lines.push({ accountId: getAccountByKind(accounts, 'sales_revenue').id, debit: 0, credit: totals.afterDiscount });
@@ -2079,11 +3825,15 @@ export default function AccountingApp() {
     }
     const je = makeEntry(jeNo, data.date, `فاتورة مبيعات #${no}`, lines, 'sales', invId);
 
+    const rep = data.repId ? reps.find(r => r.id === data.repId) : null;
+    const commissionAmount = rep ? totals.afterDiscount * (Number(rep.commissionPercent) || 0) / 100 : 0;
+
     const invoice = {
       id: invId, no, date: data.date, customerId: data.customerId, items: data.items,
       discount: data.discount, subtotal: totals.subtotal, tax: totals.tax, total: totals.total,
       paymentMethod: data.paymentMethod, paidAmount: data.paymentMethod === 'credit' ? 0 : totals.total,
-      journalId: je.id,
+      journalId: je.id, dueDate: data.dueDate || addDays(data.date, settings.defaultPaymentTermsDays),
+      repId: data.repId || null, commissionAmount, isVipSale: !!data.isVipSale,
     };
 
     const nextProducts = products.map(p => {
@@ -2103,50 +3853,62 @@ export default function AccountingApp() {
   }
 
   /* ---------- Purchase Invoice ---------- */
-  function addPurchaseInvoice(data) {
-    const totals = computeInvoiceTotals(data.items, data.discount, data.applyTax, settings.taxRate);
-    const no = settings.nextPurchaseNo;
-    const invId = uid('pinv');
-    const jeNo = settings.nextJournalNo;
+  function addPurchaseInvoicesBatch(dataArray) {
+    let no = settings.nextPurchaseNo;
+    let jeNo = settings.nextJournalNo;
+    const newInvoices = [];
+    const newJournalEntries = [];
+    let workingProducts = products.map(p => ({ ...p }));
 
-    const lines = [];
-    lines.push({ accountId: getAccountByKind(accounts, 'inventory').id, debit: totals.afterDiscount, credit: 0 });
-    if (totals.tax > 0) lines.push({ accountId: getAccountByKind(accounts, 'vat_in').id, debit: totals.tax, credit: 0 });
-    if (data.paymentMethod === 'credit') {
-      lines.push({ accountId: getAccountByKind(accounts, 'ap').id, debit: 0, credit: totals.total });
-    } else {
-      const cashAcc = getCashLikeAccountId(accounts, data.paymentMethod);
-      lines.push({ accountId: cashAcc, debit: 0, credit: totals.total });
-    }
-    const je = makeEntry(jeNo, data.date, `فاتورة مشتريات #${no}`, lines, 'purchase', invId);
+    dataArray.forEach(data => {
+      const totals = computeInvoiceTotals(data.items, data.discount, data.applyTax, settings);
+      const invId = uid('pinv');
 
-    const invoice = {
-      id: invId, no, date: data.date, supplierId: data.supplierId, items: data.items,
-      discount: data.discount, subtotal: totals.subtotal, tax: totals.tax, total: totals.total,
-      paymentMethod: data.paymentMethod, paidAmount: data.paymentMethod === 'credit' ? 0 : totals.total,
-      journalId: je.id,
-    };
+      const lines = [];
+      lines.push({ accountId: getAccountByKind(accounts, 'inventory').id, debit: totals.afterDiscount, credit: 0 });
+      if (totals.tax > 0) lines.push({ accountId: getAccountByKind(accounts, 'vat_in').id, debit: totals.tax, credit: 0 });
+      if (data.paymentMethod === 'credit') {
+        lines.push({ accountId: getAccountByKind(accounts, 'ap').id, debit: 0, credit: totals.total });
+      } else {
+        const cashAcc = resolveTreasuryAccountId(data.paymentMethod, accounts);
+        lines.push({ accountId: cashAcc, debit: 0, credit: totals.total });
+      }
+      const je = makeEntry(jeNo, data.date, `فاتورة مشتريات #${no}`, lines, 'purchase', invId);
 
-    const nextProducts = products.map(p => {
-      const item = data.items.find(it => it.productId === p.id);
-      return item ? { ...p, qty: Number(p.qty) + Number(item.qty), costPrice: Number(item.price) } : p;
+      const invoice = {
+        id: invId, no, date: data.date, supplierId: data.supplierId, items: data.items,
+        discount: data.discount, subtotal: totals.subtotal, tax: totals.tax, total: totals.total,
+        paymentMethod: data.paymentMethod, paidAmount: data.paymentMethod === 'credit' ? 0 : totals.total,
+        journalId: je.id,
+      };
+
+      workingProducts = workingProducts.map(p => {
+        const item = data.items.find(it => it.productId === p.id);
+        return item ? { ...p, qty: Number(p.qty) + Number(item.qty), costPrice: Number(item.price) } : p;
+      });
+
+      newInvoices.push(invoice);
+      newJournalEntries.push(je);
+      no += 1;
+      jeNo += 1;
     });
-    const nextSettings = { ...settings, nextPurchaseNo: no + 1, nextJournalNo: jeNo + 1 };
-    const nextJournal = [...journalEntries, je];
-    const nextPurchases = [...purchaseInvoices, invoice];
 
-    setPurchaseInvoices(nextPurchases); setProducts(nextProducts); setJournalEntries(nextJournal); setSettings(nextSettings);
+    const nextSettings = { ...settings, nextPurchaseNo: no, nextJournalNo: jeNo };
+    const nextJournal = [...journalEntries, ...newJournalEntries];
+    const nextPurchases = [...purchaseInvoices, ...newInvoices];
+
+    setPurchaseInvoices(nextPurchases); setProducts(workingProducts); setJournalEntries(nextJournal); setSettings(nextSettings);
     persist(STORAGE_KEYS.purchases, nextPurchases);
-    persist(STORAGE_KEYS.products, nextProducts);
+    persist(STORAGE_KEYS.products, workingProducts);
     persist(STORAGE_KEYS.journal, nextJournal);
     persist(STORAGE_KEYS.settings, nextSettings);
-    showToast(`تم حفظ فاتورة المشتريات #${no}`);
+    showToast(newInvoices.length > 1 ? `تم حفظ ${newInvoices.length} فواتير مشتريات` : `تم حفظ فاتورة المشتريات #${newInvoices[0].no}`);
   }
 
   /* ---------- Expenses ---------- */
   function addExpense(data) {
     const jeNo = settings.nextJournalNo;
-    const cashAcc = getCashLikeAccountId(accounts, data.paymentMethod);
+    const cashAcc = resolveTreasuryAccountId(data.paymentMethod, accounts);
     const lines = [
       { accountId: data.accountId, debit: data.amount, credit: 0 },
       { accountId: cashAcc, debit: 0, credit: data.amount },
@@ -2168,7 +3930,7 @@ export default function AccountingApp() {
   /* ---------- Payments ---------- */
   function recordPayment(type, contact, data) {
     const jeNo = settings.nextJournalNo;
-    const cashAcc = getCashLikeAccountId(accounts, data.method);
+    const cashAcc = resolveTreasuryAccountId(data.method, accounts);
     let lines, je, nextSettings, nextJournal;
 
     if (type === 'customer') {
@@ -2193,7 +3955,70 @@ export default function AccountingApp() {
     setJournalEntries(nextJournal); setSettings(nextSettings);
     persist(STORAGE_KEYS.journal, nextJournal);
     persist(STORAGE_KEYS.settings, nextSettings);
+
+    const paymentRecord = {
+      id: uid('pay'), type, contactId: contact.id, invoiceId: data.invoiceId,
+      amount: data.amount, method: data.method, date: data.date, journalId: je.id,
+    };
+    const nextPayments = [...payments, paymentRecord];
+    setPayments(nextPayments); persist(STORAGE_KEYS.payments, nextPayments);
+
     showToast('تم تسجيل الدفعة بنجاح');
+  }
+
+  /* ---------- Reps (Distributors) ---------- */
+  /* ---------- Workers / Employees ---------- */
+  function addWorker(form) {
+    const worker = { id: uid('wrk'), ...form };
+    const next = [...workers, worker];
+    setWorkers(next); persist(STORAGE_KEYS.workers, next);
+    showToast('تمت إضافة العامل بنجاح');
+  }
+  function updateWorker(updated) {
+    const next = workers.map(w => w.id === updated.id ? updated : w);
+    setWorkers(next); persist(STORAGE_KEYS.workers, next);
+    showToast('تم تحديث بيانات العامل');
+  }
+  function deleteWorker(id) {
+    const next = workers.filter(w => w.id !== id);
+    setWorkers(next); persist(STORAGE_KEYS.workers, next);
+    showToast('تم الحذف');
+  }
+
+  function addRep(form) {
+    const rep = { id: uid('rep'), no: settings.nextRepNo, name: form.name.trim(), phone: form.phone || '', commissionPercent: Number(form.commissionPercent) };
+    const next = [...reps, rep];
+    const nextSettings = { ...settings, nextRepNo: settings.nextRepNo + 1 };
+    setReps(next); setSettings(nextSettings);
+    persist(STORAGE_KEYS.reps, next); persist(STORAGE_KEYS.settings, nextSettings);
+    showToast('تمت إضافة المندوب');
+  }
+  function updateRep(updated) {
+    const next = reps.map(r => r.id === updated.id ? updated : r);
+    setReps(next); persist(STORAGE_KEYS.reps, next);
+    showToast('تم تحديث بيانات المندوب');
+  }
+  function deleteRep(id) {
+    const next = reps.filter(r => r.id !== id);
+    setReps(next); persist(STORAGE_KEYS.reps, next);
+    showToast('تم حذف المندوب');
+  }
+
+  /* ---------- Recurring Invoice Templates ---------- */
+  function addRecurringTemplate(form) {
+    const tpl = { id: uid('rec'), ...form, active: true };
+    const next = [...recurringTemplates, tpl];
+    setRecurringTemplates(next); persist(STORAGE_KEYS.recurring, next);
+    showToast('تم إنشاء الفاتورة الدورية');
+  }
+  function toggleRecurringTemplate(id) {
+    const next = recurringTemplates.map(t => t.id === id ? { ...t, active: !t.active } : t);
+    setRecurringTemplates(next); persist(STORAGE_KEYS.recurring, next);
+  }
+  function deleteRecurringTemplate(id) {
+    const next = recurringTemplates.filter(t => t.id !== id);
+    setRecurringTemplates(next); persist(STORAGE_KEYS.recurring, next);
+    showToast('تم حذف الفاتورة الدورية');
   }
 
   /* ---------- Manual Journal ---------- */
@@ -2217,6 +4042,7 @@ export default function AccountingApp() {
     const freshAccounts = DEFAULT_ACCOUNTS.map(a => ({ ...a }));
     setSettings(DEFAULT_SETTINGS); setAccounts(freshAccounts); setCustomers([]); setSuppliers([]);
     setProducts([]); setSalesInvoices([]); setPurchaseInvoices([]); setExpenses([]); setJournalEntries([]);
+    setReps([]); setRecurringTemplates([]); setPayments([]); setWorkers([]);
     await Promise.all([
       saveKey(STORAGE_KEYS.settings, DEFAULT_SETTINGS),
       saveKey(STORAGE_KEYS.accounts, freshAccounts),
@@ -2227,6 +4053,10 @@ export default function AccountingApp() {
       saveKey(STORAGE_KEYS.purchases, []),
       saveKey(STORAGE_KEYS.expenses, []),
       saveKey(STORAGE_KEYS.journal, []),
+      saveKey(STORAGE_KEYS.reps, []),
+      saveKey(STORAGE_KEYS.recurring, []),
+      saveKey(STORAGE_KEYS.payments, []),
+      saveKey(STORAGE_KEYS.workers, []),
     ]);
     setActiveTab('dashboard');
     showToast('تم حذف جميع البيانات');
@@ -2258,31 +4088,61 @@ export default function AccountingApp() {
               onNavigate={setActiveTab}
             />
           )}
+          {activeTab === 'treasury' && (
+            <TreasuryView
+              accounts={accounts} journalEntries={journalEntries} currency={settings.currency}
+              onAddAccount={addTreasuryAccount} onDeleteAccount={deleteTreasuryAccount} onAddTransaction={addTreasuryTransaction}
+            />
+          )}
           {activeTab === 'accounts' && (
             <AccountsView accounts={accounts} journalEntries={journalEntries} currency={settings.currency} onAdd={addAccount} onDelete={deleteAccount} />
           )}
           {activeTab === 'customers' && (
             <ContactsView
-              type="customer" contacts={customers} invoices={salesInvoices} currency={settings.currency}
+              type="customer" contacts={customers} invoices={salesInvoices} currency={settings.currency} settings={settings} accounts={accounts}
               onAdd={(f) => addContact('customer', f)} onUpdate={(c) => updateContact('customer', c)} onDelete={(id) => deleteContact('customer', id)}
               onRecordPayment={(contact, data) => recordPayment('customer', contact, data)}
             />
           )}
           {activeTab === 'suppliers' && (
             <ContactsView
-              type="supplier" contacts={suppliers} invoices={purchaseInvoices} currency={settings.currency}
+              type="supplier" contacts={suppliers} invoices={purchaseInvoices} currency={settings.currency} accounts={accounts}
               onAdd={(f) => addContact('supplier', f)} onUpdate={(c) => updateContact('supplier', c)} onDelete={(id) => deleteContact('supplier', id)}
               onRecordPayment={(contact, data) => recordPayment('supplier', contact, data)}
+            />
+          )}
+          {activeTab === 'workers' && (
+            <WorkersView workers={workers} currency={settings.currency} onAdd={addWorker} onUpdate={updateWorker} onDelete={deleteWorker} />
+          )}
+          {activeTab === 'statement' && (
+            <StatementView
+              customers={customers} suppliers={suppliers} salesInvoices={salesInvoices}
+              purchaseInvoices={purchaseInvoices} payments={payments} accounts={accounts} settings={settings}
             />
           )}
           {activeTab === 'products' && (
             <ProductsView products={products} currency={settings.currency} onAdd={addProduct} onUpdate={updateProduct} onDelete={deleteProduct} usedProductIds={usedProductIds} />
           )}
           {activeTab === 'sales' && (
-            <SalesInvoicesView invoices={salesInvoices} customers={customers} products={products} settings={settings} onAdd={addSalesInvoice} />
+            <SalesInvoicesView invoices={salesInvoices} customers={customers} products={products} reps={reps} accounts={accounts} settings={settings} onAdd={addSalesInvoice} />
           )}
           {activeTab === 'purchases' && (
-            <PurchaseInvoicesView invoices={purchaseInvoices} suppliers={suppliers} products={products} settings={settings} onAdd={addPurchaseInvoice} />
+            <PurchaseInvoicesView invoices={purchaseInvoices} suppliers={suppliers} products={products} accounts={accounts} settings={settings} onAdd={addPurchaseInvoicesBatch} />
+          )}
+          {activeTab === 'recurring' && (
+            <RecurringInvoicesView
+              templates={recurringTemplates} customers={customers} products={products} reps={reps} accounts={accounts} settings={settings}
+              onAdd={addRecurringTemplate} onToggle={toggleRecurringTemplate} onDelete={deleteRecurringTemplate}
+            />
+          )}
+          {activeTab === 'reminders' && (
+            <RemindersView salesInvoices={salesInvoices} customers={customers} settings={settings} showToast={showToast} />
+          )}
+          {activeTab === 'forecast' && (
+            <ForecastView products={products} salesInvoices={salesInvoices} currency={settings.currency} />
+          )}
+          {activeTab === 'reps' && (
+            <RepsView reps={reps} salesInvoices={salesInvoices} currency={settings.currency} onAdd={addRep} onUpdate={updateRep} onDelete={deleteRep} />
           )}
           {activeTab === 'expenses' && (
             <ExpensesView expenses={expenses} accounts={accounts} settings={settings} onAdd={addExpense} />
@@ -2291,7 +4151,7 @@ export default function AccountingApp() {
             <JournalView journalEntries={journalEntries} accounts={accounts} currency={settings.currency} onAddManual={addManualJournal} />
           )}
           {activeTab === 'reports' && (
-            <ReportsView accounts={accounts} journalEntries={journalEntries} currency={settings.currency} />
+            <ReportsView accounts={accounts} journalEntries={journalEntries} products={products} salesInvoices={salesInvoices} purchaseInvoices={purchaseInvoices} currency={settings.currency} />
           )}
           {activeTab === 'settings' && (
             <SettingsView settings={settings} onSave={saveSettings} onResetAll={resetAll} />
