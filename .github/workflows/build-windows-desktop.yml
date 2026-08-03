@@ -19,7 +19,9 @@ jobs:
         run: npm install
 
       - name: Build Windows app (installer + portable)
-        run: npm run electron:build:win
+        run: npm run electron:build:win -- --publish never
+        env:
+          GH_TOKEN: ""
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
